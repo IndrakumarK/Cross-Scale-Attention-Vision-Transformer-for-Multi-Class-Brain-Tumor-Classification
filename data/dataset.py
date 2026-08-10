@@ -31,14 +31,23 @@ CLASS_NAMES = [
 
 
 # ============================================================
+# Dataset Information
+# ============================================================
+
+EXPECTED_PATIENTS = 200
+EXPECTED_SAMPLES = 1800
+EXPECTED_SAMPLES_PER_CLASS = 450
+
+
+# ============================================================
 # Multi-Sequence MRI Dataset
 # ============================================================
 
 class MultiSequenceNPZDataset(Dataset):
     """
-    Dataset loader for CSA-ViT.
+    Dataset loader for the CSA-ViT framework.
 
-    Each .npz file must contain four MRI sequences:
+    Each NPZ file must contain four MRI sequences:
 
         T1
         T1CE
@@ -58,6 +67,9 @@ class MultiSequenceNPZDataset(Dataset):
         1 -> Glioma
         2 -> Meningioma
         3 -> Pituitary
+
+    The dataset manifest must assign each patient to exactly
+    one split: train, val, or test.
     """
 
     def __init__(
@@ -91,7 +103,7 @@ class MultiSequenceNPZDataset(Dataset):
         images = []
 
         # ----------------------------------------------------
-        # Process T1, T1CE, T2 and FLAIR
+        # Process MRI modalities
         # ----------------------------------------------------
 
         for modality in MODALITIES:
@@ -105,14 +117,12 @@ class MultiSequenceNPZDataset(Dataset):
 
             image = data[modality]
 
-            # Ensure numerical array
             image = np.asarray(
                 image,
                 dtype=np.float32
             )
 
-            # Preprocessing:
-            # intensity standardization + resizing
+            # Intensity standardization and resizing
             image = preprocess_sequence(
                 image,
                 self.image_size
@@ -121,7 +131,7 @@ class MultiSequenceNPZDataset(Dataset):
             images.append(image)
 
         # ----------------------------------------------------
-        # Combine modalities
+        # Combine four MRI modalities
         #
         # Output:
         # [4, 224, 224]
@@ -136,7 +146,7 @@ class MultiSequenceNPZDataset(Dataset):
         )
 
         # ----------------------------------------------------
-        # Class label
+        # Validate label
         # ----------------------------------------------------
 
         label = int(row["label"])
@@ -162,7 +172,7 @@ class MultiSequenceNPZDataset(Dataset):
 
 def load_manifest(csv_path):
     """
-    Load the patient-level dataset manifest.
+    Load and validate the patient-level dataset manifest.
 
     Required columns:
 
@@ -170,9 +180,16 @@ def load_manifest(csv_path):
         label
         patient_id
         split
+
+    The manifest is expected to contain the selected
+    1,800 MRI samples obtained from 200 patients.
     """
 
     df = pd.read_csv(csv_path)
+
+    # --------------------------------------------------------
+    # Required columns
+    # --------------------------------------------------------
 
     required_columns = {
         "path",
@@ -193,6 +210,19 @@ def load_manifest(csv_path):
             + ", ".join(
                 sorted(missing_columns)
             )
+        )
+
+    # --------------------------------------------------------
+    # Check missing values
+    # --------------------------------------------------------
+
+    if df[
+        ["path", "label", "patient_id", "split"]
+    ].isnull().any().any():
+
+        raise ValueError(
+            "The manifest contains missing values in "
+            "path, label, patient_id, or split."
         )
 
     # --------------------------------------------------------
@@ -234,6 +264,62 @@ def load_manifest(csv_path):
             "Manifest contains invalid class labels."
         )
 
+    # --------------------------------------------------------
+    # Validate expected dataset size
+    # --------------------------------------------------------
+
+    number_of_patients = (
+        df["patient_id"].nunique()
+    )
+
+    number_of_samples = len(df)
+
+    if number_of_patients != EXPECTED_PATIENTS:
+
+        raise ValueError(
+            f"Expected {EXPECTED_PATIENTS} patients, "
+            f"but manifest contains "
+            f"{number_of_patients} unique patients."
+        )
+
+    if number_of_samples != EXPECTED_SAMPLES:
+
+        raise ValueError(
+            f"Expected {EXPECTED_SAMPLES} MRI samples, "
+            f"but manifest contains "
+            f"{number_of_samples} samples."
+        )
+
+    # --------------------------------------------------------
+    # Validate overall class distribution
+    # --------------------------------------------------------
+
+    class_counts = (
+        df["label"]
+        .value_counts()
+        .sort_index()
+    )
+
+    for label in range(len(CLASS_NAMES)):
+
+        count = int(
+            class_counts.get(label, 0)
+        )
+
+        if count != EXPECTED_SAMPLES_PER_CLASS:
+
+            raise ValueError(
+                f"Class '{CLASS_NAMES[label]}' contains "
+                f"{count} samples; expected "
+                f"{EXPECTED_SAMPLES_PER_CLASS}."
+            )
+
+    # --------------------------------------------------------
+    # Check patient leakage
+    # --------------------------------------------------------
+
+    check_patient_leakage(df)
+
     return df
 
 
@@ -246,7 +332,7 @@ def get_split(
     split_name
 ):
     """
-    Return one patient-level split.
+    Return one patient-level dataset split.
 
     split_name:
         train
@@ -271,6 +357,12 @@ def get_split(
         dataframe["split"] == split_name
     ].copy()
 
+    if len(split_df) == 0:
+
+        raise ValueError(
+            f"The '{split_name}' split contains no samples."
+        )
+
     return split_df.reset_index(
         drop=True
     )
@@ -285,8 +377,9 @@ def check_patient_leakage(dataframe):
     Verify that the same patient does not occur
     in more than one dataset split.
 
-    This is important because the manuscript specifies
-    patient-level partitioning to prevent information leakage.
+    This check is critical for preventing information
+    leakage when multiple MRI samples originate from
+    the same patient.
     """
 
     patient_splits = (
@@ -301,12 +394,15 @@ def check_patient_leakage(dataframe):
 
     if len(leakage) > 0:
 
+        leakage_ids = (
+            leakage.index
+            .tolist()
+        )
+
         raise ValueError(
             "Patient-level data leakage detected. "
-            "The following patient IDs occur in multiple splits: "
-            + ", ".join(
-                map(str, leakage.index.tolist())
-            )
+            "The following patient IDs occur in multiple "
+            f"splits: {leakage_ids}"
         )
 
     return True
@@ -318,14 +414,21 @@ def check_patient_leakage(dataframe):
 
 def dataset_summary(dataframe):
     """
-    Print a summary of samples and patients in
-    train, validation and test partitions.
+    Print the number of MRI samples and unique patients
+    in the train, validation, and test partitions.
     """
 
     print("\nDataset Summary")
-    print("=" * 60)
+    print("=" * 65)
 
-    for split in ["train", "val", "test"]:
+    total_samples = 0
+    total_patients = set()
+
+    for split in [
+        "train",
+        "val",
+        "test"
+    ]:
 
         subset = dataframe[
             dataframe["split"] == split
@@ -333,9 +436,17 @@ def dataset_summary(dataframe):
 
         samples = len(subset)
 
-        patients = subset[
-            "patient_id"
-        ].nunique()
+        patients = (
+            subset["patient_id"]
+            .nunique()
+        )
+
+        total_samples += samples
+
+        total_patients.update(
+            subset["patient_id"]
+            .unique()
+        )
 
         print(
             f"{split.upper():<10} "
@@ -343,11 +454,28 @@ def dataset_summary(dataframe):
             f"Patients: {patients}"
         )
 
-    print("=" * 60)
+    print("-" * 65)
 
-    print("\nClass distribution:")
+    print(
+        f"{'TOTAL':<10} "
+        f"Samples: {total_samples:<6} "
+        f"Patients: {len(total_patients)}"
+    )
 
-    for split in ["train", "val", "test"]:
+    print("=" * 65)
+
+    # --------------------------------------------------------
+    # Class distribution
+    # --------------------------------------------------------
+
+    print("\nClass Distribution")
+    print("=" * 65)
+
+    for split in [
+        "train",
+        "val",
+        "test"
+    ]:
 
         subset = dataframe[
             dataframe["split"] == split
@@ -361,10 +489,70 @@ def dataset_summary(dataframe):
             .sort_index()
         )
 
-        for label, count in counts.items():
+        for label in range(
+            len(CLASS_NAMES)
+        ):
+
+            count = int(
+                counts.get(label, 0)
+            )
 
             print(
-                f"  {label}: "
-                f"{CLASS_NAMES[int(label)]} "
+                f"  {CLASS_NAMES[label]:<12} "
                 f"= {count}"
             )
+
+    print("=" * 65)
+
+
+# ============================================================
+# Validate Dataset Manifest
+# ============================================================
+
+def validate_manifest(dataframe):
+    """
+    Perform all dataset-level validation checks.
+    """
+
+    # Patient leakage
+    check_patient_leakage(dataframe)
+
+    # Expected patient count
+    patients = dataframe[
+        "patient_id"
+    ].nunique()
+
+    if patients != EXPECTED_PATIENTS:
+
+        raise ValueError(
+            f"Dataset contains {patients} patients. "
+            f"Expected {EXPECTED_PATIENTS}."
+        )
+
+    # Expected sample count
+    samples = len(dataframe)
+
+    if samples != EXPECTED_SAMPLES:
+
+        raise ValueError(
+            f"Dataset contains {samples} samples. "
+            f"Expected {EXPECTED_SAMPLES}."
+        )
+
+    print(
+        "\nManifest validation successful."
+    )
+
+    print(
+        f"Patients: {patients}"
+    )
+
+    print(
+        f"Samples: {samples}"
+    )
+
+    print(
+        "Patient-level leakage: None"
+    )
+
+    return True
