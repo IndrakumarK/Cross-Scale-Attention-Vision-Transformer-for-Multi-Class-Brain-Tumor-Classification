@@ -32,7 +32,12 @@ import torch
 from torch.utils.data import DataLoader
 
 from models.csavit import CSAViT
-from data.dataset import BrainMRIDataset
+from data.dataset import (
+    MultiSequenceNPZDataset,
+    load_manifest,
+    get_split,
+    check_patient_leakage
+)
 
 from utils.metrics import (
     calculate_metrics,
@@ -488,11 +493,11 @@ def main():
         help="Root directory containing MRI data."
     )
 
-    parser.add_argument(
-        "--csv_file",
-        type=str,
-        required=True,
-        help="CSV file describing the test split."
+   parser.add_argument(
+    "--csv_file",
+    type=str,
+    required=True,
+    help="CSV manifest containing patient-level train, validation, and test assignments."
     )
 
     parser.add_argument(
@@ -529,26 +534,56 @@ def main():
     # Dataset
     # ========================================================
 
-    test_dataset = BrainMRIDataset(
-        data_dir=args.data_dir,
-        csv_file=args.csv_file,
-        image_size=224,
-        train=False
-    )
+    # ========================================================
+# Load patient-level manifest
+# ========================================================
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available()
-    )
+manifest = load_manifest(
+    args.csv_file
+)
 
-    print(
-        f"Test samples: "
-        f"{len(test_dataset)}"
-    )
+# --------------------------------------------------------
+# Verify that no patient occurs in multiple splits
+# --------------------------------------------------------
 
+check_patient_leakage(
+    manifest
+)
+
+# --------------------------------------------------------
+# Select ONLY the test split
+# --------------------------------------------------------
+
+test_df = get_split(
+    manifest,
+    "test"
+)
+
+# --------------------------------------------------------
+# Create test dataset
+# --------------------------------------------------------
+
+test_dataset = MultiSequenceNPZDataset(
+    dataframe=test_df,
+    image_size=224
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=args.batch_size,
+    shuffle=False,
+    num_workers=args.num_workers,
+    pin_memory=torch.cuda.is_available()
+)
+
+print(
+    f"Test samples: {len(test_dataset)}"
+)
+
+print(
+    f"Test patients: "
+    f"{test_df['patient_id'].nunique()}"
+)
     # ========================================================
     # Model
     # ========================================================
