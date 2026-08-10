@@ -42,7 +42,7 @@ data:
   # ----------------------------------------------------------
 
   # Clinically collected dataset
-  number_of_patients: 250
+  number_of_patients: 200
 
   # Total selected MRI samples
   number_of_samples: 1800
@@ -196,7 +196,7 @@ patch_embedding:
   positional_encoding: true
 
   # ----------------------------------------------------------
-  # Token counts for 224 × 224 input
+  # Token counts for 224 Ã— 224 input
   # ----------------------------------------------------------
 
   token_counts:
