@@ -49,25 +49,25 @@ The overall CSA-ViT pipeline is:
                   │                │                │
                   └────────────────┼────────────────┘
                                    │
-                Hierarchical Cross-Scale Attention
-                              HCSAM
+                   Hierarchical Cross-Scale Attention
+                                 HCSAM
                                    │
                                    ↓
-                    Adaptive Sequence Attention
-                               SAM
+                       Adaptive Sequence Attention
+                                  SAM
                                    │
                                    ↓
-                       Transformer Encoder
+                           Transformer Encoder
                                    │
                                    ↓
-                    Attention-Based Aggregation
+                       Attention-Based Aggregation
                                    │
                                    ↓
-                       Classification Head
+                            Classification Head
                                    │
-          ┌────────────┬───────────┼───────────┬─────────────┐
+          ┌────────────┬───────────┼───────────┬
           │            │           │           │
-       Healthy       Glioma    Meningioma   Pituitary
+       Healthy      Glioma    Meningioma   Pituitary
 
 ````
 
