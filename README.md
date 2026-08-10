@@ -84,14 +84,6 @@ The preprocessing pipeline consists of:
 3. Intensity standardization
 4. Resizing to `224 × 224` pixels
 
-Intensity standardization is performed using:
-
-$$
-\hat{I}(p)=
-\frac{I(p)-E[I]}
-{\sqrt{\operatorname{Var}(I)+\epsilon}}
-$$
-
 ---
 
 ### 2. Lightweight CNN Stem
@@ -175,11 +167,7 @@ FLAIR    ─┘
 
 Before adaptive fusion, the modality-specific representations are projected to a common embedding dimension of `256`.
 
-Learned attention coefficients are then used for weighted aggregation:
-
-$$
-F_{SAM} = \sum_{i=1}^{M} \beta_i F_i
-$$
+Learned attention coefficients are then used for weighted aggregation
 
 This allows the network to adaptively emphasize diagnostically informative MRI sequences.
 
@@ -216,20 +204,9 @@ The classifier predicts one of four classes:
 
 ### 8. Confidence-Aware Uncertainty
 
-Predictive uncertainty is calculated from the class-probability distribution using normalized entropy:
-
-$$
-U(x)=
--\frac{1}{\log C}
-\sum_{c=1}^{C}
-p_c(x)\log(p_c(x)+\epsilon)
-$$
-
-where (C=4).
+Predictive uncertainty is calculated from the class-probability distribution using normalized entropy
 
 Lower entropy indicates greater confidence, whereas higher entropy indicates greater ambiguity in the predicted class distribution.
-
-**Important:** The implementation provides **sample-level predictive uncertainty**. It does not interpret classification entropy as a spatial uncertainty map.
 
 ---
 
@@ -381,15 +358,10 @@ CSA-ViT/
 │   └── visualization.py
 │
 ├── experiments/
-│   ├── __init__.py
-│   ├── baseline_vit.py
-│   ├── ablation.py
-│   └── repeated_runs.py
-│
-└── results/
-    ├── figures/
-    └── tables/
-
+    ├── __init__.py
+    ├── baseline_vit.py
+    ├── ablation.py
+    └── repeated_runs.py
 ```
 
 ---
@@ -590,11 +562,11 @@ Baseline Vision Transformer
           ↓
 + Multi-Scale Patch Embedding
           ↓
-+ HCSAM
+        + HCSAM
           ↓
-+ SAM
+        + SAM
           ↓
-Complete CSA-ViT
+    Complete CSA-ViT
 
 ```
 
@@ -617,7 +589,6 @@ The corresponding experimental code is located in:
 experiments/baseline_vit.py
 
 ```
-
 ---
 
 # Visualization
@@ -782,13 +753,11 @@ If you use CSA-ViT or this implementation in academic work, please cite the asso
   title   = {CSA-ViT: Cross-Scale Attention Vision Transformer
              for Multi-Class Brain Tumor Classification Using
              Multi-Sequence MRI},
-  author  = {Indrakumar, K. and Ravikumar, M.},
+  author  = {Indrakumar, K},
   year    = {2026}
 }
 
 ```
-
-The citation should be updated with the final journal/conference bibliographic information after publication.
 
 ---
 
@@ -812,5 +781,4 @@ For questions regarding the CSA-ViT implementation or research methodology, plea
 
 The authors acknowledge the institutional support and clinical research resources that enabled the collection and analysis of the MRI data used in this study.
 
-```
 ```
