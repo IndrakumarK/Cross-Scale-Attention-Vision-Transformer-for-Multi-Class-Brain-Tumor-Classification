@@ -1,65 +1,130 @@
 """
-CSA-ViT Test Script
-===================
+CSA-ViT Test / Evaluation Script
+================================
 
-Runs the trained CSA-ViT model on the test dataset.
+Evaluates a trained CSA-ViT model on the patient-level internal
+held-out test set described in the manuscript.
 
-Reports:
-    - Accuracy
-    - Precision
-    - Recall
-    - F1-score
-    - Macro One-vs-Rest AUC
-    - Confusion matrix
-    - Class-wise results
+Manuscript configuration
+------------------------
+Dataset:
+    1,800 MRI samples
+    200 patients
+    4 classes
+        0 - No-tumor
+        1 - Glioma
+        2 - Meningioma
+        3 - Pituitary
 
-This script is intended for the final held-out test split.
-Patient-level splitting should be performed before creating
-the test CSV.
+Patient-level split:
+    70% training
+    15% validation
+    15% test
 
-Classes:
-    0 - Healthy
-    1 - Glioma
-    2 - Meningioma
-    3 - Pituitary Tumor
+Internal test set:
+    270 samples
+    67 No-tumor
+    68 Glioma
+    67 Meningioma
+    68 Pituitary
+
+Model:
+    CSA-ViT
+    Input: 224 x 224
+    Four MRI sequences: T1, T1CE, T2, FLAIR
+    Embedding dimension: 256
+    Patch sizes: 8, 16, 32
+    HCSAM: 6 blocks, 8 heads
+    Transformer encoder: 6 layers
+    Dropout: 0.1
+
+Reported test metrics:
+    Accuracy
+    Macro Precision
+    Macro Recall
+    Macro F1
+    Macro One-vs-Rest AUC
+
+Additional outputs:
+    Class-wise precision / recall / F1
+    Confusion matrix
+    Predicted probabilities
+    Test predictions CSV
+
+IMPORTANT:
+    This script evaluates ONLY the held-out test partition.
+
+    The manuscript's Figure 4 is a descriptive confusion matrix
+    across the complete 1,800-sample dataset. The confusion matrix
+    generated here is specifically for the 270-sample held-out
+    internal test set and should not automatically replace Figure 4
+    unless the manuscript is revised accordingly.
 """
 
-import os
 import argparse
+import csv
+import json
+import os
+import random
+from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    confusion_matrix,
+)
+
 from models.csavit import CSAViT
-from data.dataset import (
-    MultiSequenceNPZDataset,
-    load_manifest,
-    get_split,
-    check_patient_leakage
-)
-
-from utils.metrics import (
-    calculate_metrics,
-    calculate_classwise_metrics,
-    calculate_confusion_matrix
-)
-
-from utils.visualization import (
-    plot_confusion_matrix
-)
+from data.dataset import BrainMRIDataset
 
 
 # ============================================================
-# Class Names
+# Constants
 # ============================================================
 
 CLASS_NAMES = [
-    "Healthy",
+    "No-tumor",
     "Glioma",
     "Meningioma",
-    "Pituitary Tumor"
+    "Pituitary",
 ]
+
+NUM_CLASSES = 4
+
+EXPECTED_TEST_COUNTS = {
+    "No-tumor": 67,
+    "Glioma": 68,
+    "Meningioma": 67,
+    "Pituitary": 68,
+}
+
+
+# ============================================================
+# Reproducibility
+# ============================================================
+
+def set_seed(seed=42):
+    """
+    Set random seeds for deterministic evaluation.
+    """
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 # ============================================================
@@ -69,524 +134,16 @@ CLASS_NAMES = [
 def get_device():
 
     if torch.cuda.is_available():
+        return torch.device("cuda")
 
-        return torch.device(
-            "cuda"
-        )
-
-    return torch.device(
-        "cpu"
-    )
+    return torch.device("cpu")
 
 
 # ============================================================
-# Load Checkpoint
+# CSA-ViT Model
 # ============================================================
 
-def load_checkpoint(
-    model,
-    checkpoint_path,
-    device
-):
-    """
-    Load a trained CSA-ViT checkpoint.
-
-    Supports either:
-
-        model.state_dict()
-
-    or:
-
-        {
-            "model_state_dict": ...
-        }
-    """
-
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location=device
-    )
-
-    if (
-        isinstance(
-            checkpoint,
-            dict
-        )
-        and
-        "model_state_dict" in checkpoint
-    ):
-
-        state_dict = checkpoint[
-            "model_state_dict"
-        ]
-
-    else:
-
-        state_dict = checkpoint
-
-    model.load_state_dict(
-        state_dict
-    )
-
-    return model
-
-
-# ============================================================
-# Test Function
-# ============================================================
-
-@torch.no_grad()
-def run_test(
-    model,
-    dataloader,
-    device
-):
-    """
-    Run inference on the test dataset.
-
-    Returns
-    -------
-    y_true
-    y_pred
-    y_prob
-    """
-
-    model.eval()
-
-    y_true = []
-    y_pred = []
-    y_prob = []
-
-    for batch in dataloader:
-
-        # ----------------------------------------------------
-        # Expected dataset output:
-        #
-        # images, labels
-        #
-        # If metadata is returned:
-        #
-        # images, labels, metadata
-        # ----------------------------------------------------
-
-        images = batch[0]
-        labels = batch[1]
-
-        images = images.to(
-            device,
-            non_blocking=True
-        )
-
-        labels = labels.to(
-            device,
-            non_blocking=True
-        )
-
-        # ----------------------------------------------------
-        # Forward pass
-        # ----------------------------------------------------
-
-        output = model(
-            images
-        )
-
-        # ----------------------------------------------------
-        # Support both:
-        #
-        # logits tensor
-        #
-        # and model output dictionary
-        # ----------------------------------------------------
-
-        if isinstance(
-            output,
-            dict
-        ):
-
-            logits = output[
-                "logits"
-            ]
-
-        else:
-
-            logits = output
-
-        # ----------------------------------------------------
-        # Probabilities
-        # ----------------------------------------------------
-
-        probabilities = torch.softmax(
-            logits,
-            dim=1
-        )
-
-        predictions = torch.argmax(
-            probabilities,
-            dim=1
-        )
-
-        # ----------------------------------------------------
-        # Store
-        # ----------------------------------------------------
-
-        y_true.extend(
-            labels.cpu().numpy()
-        )
-
-        y_pred.extend(
-            predictions.cpu().numpy()
-        )
-
-        y_prob.append(
-            probabilities.cpu()
-        )
-
-    y_true = np.asarray(
-        y_true
-    )
-
-    y_pred = np.asarray(
-        y_pred
-    )
-
-    y_prob = torch.cat(
-        y_prob,
-        dim=0
-    ).numpy()
-
-    return (
-        y_true,
-        y_pred,
-        y_prob
-    )
-
-
-# ============================================================
-# Print Overall Results
-# ============================================================
-
-def print_overall_results(
-    metrics
-):
-
-    print(
-        "\n"
-        + "=" * 65
-    )
-
-    print(
-        "CSA-ViT TEST-SET RESULTS"
-    )
-
-    print(
-        "=" * 65
-    )
-
-    print(
-        f"Accuracy   : "
-        f"{metrics['accuracy'] * 100:.2f}%"
-    )
-
-    print(
-        f"Precision  : "
-        f"{metrics['precision'] * 100:.2f}%"
-    )
-
-    print(
-        f"Recall     : "
-        f"{metrics['recall'] * 100:.2f}%"
-    )
-
-    print(
-        f"F1-score   : "
-        f"{metrics['f1_score'] * 100:.2f}%"
-    )
-
-    if np.isnan(
-        metrics["auc"]
-    ):
-
-        print(
-            "Macro AUC  : N/A"
-        )
-
-    else:
-
-        print(
-            f"Macro AUC  : "
-            f"{metrics['auc'] * 100:.2f}%"
-        )
-
-    print(
-        "=" * 65
-    )
-
-
-# ============================================================
-# Print Class-wise Results
-# ============================================================
-
-def print_classwise_results(
-    classwise
-):
-
-    print(
-        "\nClass-wise Classification Results"
-    )
-
-    print(
-        "-" * 80
-    )
-
-    print(
-        f"{'Class':<20}"
-        f"{'Precision':>12}"
-        f"{'Recall':>12}"
-        f"{'F1-score':>12}"
-        f"{'Support':>12}"
-    )
-
-    print(
-        "-" * 80
-    )
-
-    for class_name, values in (
-        classwise.items()
-    ):
-
-        print(
-            f"{class_name:<20}"
-            f"{values['precision']:>12.4f}"
-            f"{values['recall']:>12.4f}"
-            f"{values['f1_score']:>12.4f}"
-            f"{values['support']:>12}"
-        )
-
-    print(
-        "-" * 80
-    )
-
-
-# ============================================================
-# Save Results
-# ============================================================
-
-def save_results(
-    metrics,
-    classwise,
-    save_path
-):
-    """
-    Save test results as a text file.
-    """
-
-    directory = os.path.dirname(
-        save_path
-    )
-
-    if directory:
-
-        os.makedirs(
-            directory,
-            exist_ok=True
-        )
-
-    with open(
-        save_path,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        file.write(
-            "CSA-ViT Test Results\n"
-        )
-
-        file.write(
-            "=" * 60 + "\n\n"
-        )
-
-        file.write(
-            f"Accuracy: "
-            f"{metrics['accuracy'] * 100:.4f}%\n"
-        )
-
-        file.write(
-            f"Precision: "
-            f"{metrics['precision'] * 100:.4f}%\n"
-        )
-
-        file.write(
-            f"Recall: "
-            f"{metrics['recall'] * 100:.4f}%\n"
-        )
-
-        file.write(
-            f"F1-score: "
-            f"{metrics['f1_score'] * 100:.4f}%\n"
-        )
-
-        file.write(
-            f"Macro AUC: "
-            f"{metrics['auc'] * 100:.4f}%\n"
-        )
-
-        file.write(
-            "\nClass-wise Results\n"
-        )
-
-        file.write(
-            "-" * 60 + "\n"
-        )
-
-        for class_name, values in (
-            classwise.items()
-        ):
-
-            file.write(
-                f"\n{class_name}\n"
-            )
-
-            file.write(
-                f"Precision: "
-                f"{values['precision']:.6f}\n"
-            )
-
-            file.write(
-                f"Recall: "
-                f"{values['recall']:.6f}\n"
-            )
-
-            file.write(
-                f"F1-score: "
-                f"{values['f1_score']:.6f}\n"
-            )
-
-            file.write(
-                f"Support: "
-                f"{values['support']}\n"
-            )
-
-
-# ============================================================
-# Main
-# ============================================================
-
-def main():
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Test a trained CSA-ViT model."
-        )
-    )
-
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        required=True,
-        help="Path to trained CSA-ViT checkpoint."
-    )
-
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        required=True,
-        help="Root directory containing MRI data."
-    )
-
-   parser.add_argument(
-    "--csv_file",
-    type=str,
-    required=True,
-    help="CSV manifest containing patient-level train, validation, and test assignments."
-    )
-
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=32
-    )
-
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=4
-    )
-
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="results/test"
-    )
-
-    args = parser.parse_args()
-
-    # ========================================================
-    # Device
-    # ========================================================
-
-    device = get_device()
-
-    print(
-        f"Device: {device}"
-    )
-
-    # ========================================================
-    # Dataset
-    # ========================================================
-
-    # ========================================================
-# Load patient-level manifest
-# ========================================================
-
-manifest = load_manifest(
-    args.csv_file
-)
-
-# --------------------------------------------------------
-# Verify that no patient occurs in multiple splits
-# --------------------------------------------------------
-
-check_patient_leakage(
-    manifest
-)
-
-# --------------------------------------------------------
-# Select ONLY the test split
-# --------------------------------------------------------
-
-test_df = get_split(
-    manifest,
-    "test"
-)
-
-# --------------------------------------------------------
-# Create test dataset
-# --------------------------------------------------------
-
-test_dataset = MultiSequenceNPZDataset(
-    dataframe=test_df,
-    image_size=224
-)
-
-test_loader = DataLoader(
-    test_dataset,
-    batch_size=args.batch_size,
-    shuffle=False,
-    num_workers=args.num_workers,
-    pin_memory=torch.cuda.is_available()
-)
-
-print(
-    f"Test samples: {len(test_dataset)}"
-)
-
-print(
-    f"Test patients: "
-    f"{test_df['patient_id'].nunique()}"
-)
-    # ========================================================
-    # Model
-    # ========================================================
+def build_model():
 
     model = CSAViT(
         in_channels=4,
@@ -597,66 +154,859 @@ print(
         heads=8,
         transformer_layers=6,
         dropout=0.1,
-        num_classes=4
+        num_classes=NUM_CLASSES,
+    )
+
+    return model
+
+
+# ============================================================
+# Load Checkpoint
+# ============================================================
+
+def load_checkpoint(
+    model,
+    checkpoint_path,
+    device,
+):
+
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+    )
+
+    # --------------------------------------------------------
+    # Checkpoint generated by train.py
+    # --------------------------------------------------------
+
+    if (
+        isinstance(checkpoint, dict)
+        and "model_state_dict" in checkpoint
+    ):
+
+        state_dict = checkpoint[
+            "model_state_dict"
+        ]
+
+    # --------------------------------------------------------
+    # Plain state_dict
+    # --------------------------------------------------------
+
+    else:
+
+        state_dict = checkpoint
+
+    model.load_state_dict(
+        state_dict,
+        strict=True,
+    )
+
+    return model
+
+
+# ============================================================
+# Test Inference
+# ============================================================
+
+@torch.no_grad()
+def run_test(
+    model,
+    dataloader,
+    device,
+):
+
+    model.eval()
+
+    all_labels = []
+    all_predictions = []
+    all_probabilities = []
+
+    for batch in dataloader:
+
+        # ----------------------------------------------------
+        # Dataset output
+        #
+        # Expected:
+        #     images, labels
+        #
+        # Optional:
+        #     images, labels, metadata
+        # ----------------------------------------------------
+
+        images = batch[0]
+        labels = batch[1]
+
+        images = images.to(
+            device,
+            non_blocking=True,
+        )
+
+        labels = labels.to(
+            device,
+            non_blocking=True,
+        )
+
+        # ----------------------------------------------------
+        # Forward pass
+        # ----------------------------------------------------
+
+        output = model(images)
+
+        # ----------------------------------------------------
+        # Support both tensor and dictionary outputs
+        # ----------------------------------------------------
+
+        if isinstance(output, dict):
+
+            logits = output["logits"]
+
+        else:
+
+            logits = output
+
+        # ----------------------------------------------------
+        # Convert logits to probabilities
+        # ----------------------------------------------------
+
+        probabilities = torch.softmax(
+            logits,
+            dim=1,
+        )
+
+        predictions = torch.argmax(
+            probabilities,
+            dim=1,
+        )
+
+        # ----------------------------------------------------
+        # Store predictions
+        # ----------------------------------------------------
+
+        all_labels.extend(
+            labels.cpu().numpy().tolist()
+        )
+
+        all_predictions.extend(
+            predictions.cpu().numpy().tolist()
+        )
+
+        all_probabilities.append(
+            probabilities.cpu()
+        )
+
+    y_true = np.asarray(
+        all_labels,
+        dtype=np.int64,
+    )
+
+    y_pred = np.asarray(
+        all_predictions,
+        dtype=np.int64,
+    )
+
+    y_prob = torch.cat(
+        all_probabilities,
+        dim=0,
+    ).numpy()
+
+    return (
+        y_true,
+        y_pred,
+        y_prob,
+    )
+
+
+# ============================================================
+# Calculate Overall Metrics
+# ============================================================
+
+def calculate_metrics(
+    y_true,
+    y_pred,
+    y_prob,
+):
+
+    metrics = {}
+
+    metrics["accuracy"] = accuracy_score(
+        y_true,
+        y_pred,
+    )
+
+    metrics["precision"] = precision_score(
+        y_true,
+        y_pred,
+        average="macro",
+        zero_division=0,
+    )
+
+    metrics["recall"] = recall_score(
+        y_true,
+        y_pred,
+        average="macro",
+        zero_division=0,
+    )
+
+    metrics["f1"] = f1_score(
+        y_true,
+        y_pred,
+        average="macro",
+        zero_division=0,
+    )
+
+    try:
+
+        metrics["auc"] = roc_auc_score(
+            y_true,
+            y_prob,
+            multi_class="ovr",
+            average="macro",
+            labels=np.arange(NUM_CLASSES),
+        )
+
+    except ValueError:
+
+        metrics["auc"] = float("nan")
+
+    return metrics
+
+
+# ============================================================
+# Class-wise Metrics
+# ============================================================
+
+def calculate_classwise_metrics(
+    y_true,
+    y_pred,
+):
+
+    precision = precision_score(
+        y_true,
+        y_pred,
+        average=None,
+        labels=np.arange(NUM_CLASSES),
+        zero_division=0,
+    )
+
+    recall = recall_score(
+        y_true,
+        y_pred,
+        average=None,
+        labels=np.arange(NUM_CLASSES),
+        zero_division=0,
+    )
+
+    f1 = f1_score(
+        y_true,
+        y_pred,
+        average=None,
+        labels=np.arange(NUM_CLASSES),
+        zero_division=0,
+    )
+
+    support = np.bincount(
+        y_true,
+        minlength=NUM_CLASSES,
+    )
+
+    results = {}
+
+    for index, class_name in enumerate(
+        CLASS_NAMES
+    ):
+
+        results[class_name] = {
+            "precision": float(
+                precision[index]
+            ),
+            "recall": float(
+                recall[index]
+            ),
+            "f1": float(
+                f1[index]
+            ),
+            "support": int(
+                support[index]
+            ),
+        }
+
+    return results
+
+
+# ============================================================
+# Validate Test Distribution
+# ============================================================
+
+def validate_test_distribution(
+    y_true,
+):
+
+    print("\nTest-set class distribution")
+    print("-" * 60)
+
+    total = len(y_true)
+
+    for index, class_name in enumerate(
+        CLASS_NAMES
+    ):
+
+        count = int(
+            np.sum(
+                y_true == index
+            )
+        )
+
+        expected = EXPECTED_TEST_COUNTS[
+            class_name
+        ]
+
+        print(
+            f"{class_name:<15}"
+            f"Observed: {count:<5}"
+            f"Expected: {expected:<5}"
+        )
+
+    print("-" * 60)
+    print(f"Total test samples: {total}")
+
+    expected_total = sum(
+        EXPECTED_TEST_COUNTS.values()
+    )
+
+    if total != expected_total:
+
+        print(
+            "\nWARNING:"
+            f" Expected {expected_total} "
+            f"test samples but found {total}."
+        )
+
+
+# ============================================================
+# Print Overall Results
+# ============================================================
+
+def print_overall_results(
+    metrics,
+):
+
+    print("\n")
+    print("=" * 70)
+    print("CSA-ViT INTERNAL HELD-OUT TEST RESULTS")
+    print("=" * 70)
+
+    print(
+        f"Accuracy        : "
+        f"{metrics['accuracy'] * 100:.2f}%"
+    )
+
+    print(
+        f"Macro Precision : "
+        f"{metrics['precision'] * 100:.2f}%"
+    )
+
+    print(
+        f"Macro Recall    : "
+        f"{metrics['recall'] * 100:.2f}%"
+    )
+
+    print(
+        f"Macro F1        : "
+        f"{metrics['f1'] * 100:.2f}%"
+    )
+
+    if np.isnan(
+        metrics["auc"]
+    ):
+
+        print(
+            "Macro AUC       : N/A"
+        )
+
+    else:
+
+        print(
+            f"Macro AUC       : "
+            f"{metrics['auc'] * 100:.2f}%"
+        )
+
+    print("=" * 70)
+
+
+# ============================================================
+# Print Class-wise Results
+# ============================================================
+
+def print_classwise_results(
+    classwise,
+):
+
+    print("\n")
+    print("CLASS-WISE TEST RESULTS")
+    print("=" * 85)
+
+    print(
+        f"{'Class':<18}"
+        f"{'Precision':>15}"
+        f"{'Recall':>15}"
+        f"{'F1-score':>15}"
+        f"{'Support':>12}"
+    )
+
+    print("-" * 85)
+
+    for class_name in CLASS_NAMES:
+
+        values = classwise[
+            class_name
+        ]
+
+        print(
+            f"{class_name:<18}"
+            f"{values['precision'] * 100:>14.2f}%"
+            f"{values['recall'] * 100:>14.2f}%"
+            f"{values['f1'] * 100:>14.2f}%"
+            f"{values['support']:>12}"
+        )
+
+    print("-" * 85)
+
+
+# ============================================================
+# Print Confusion Matrix
+# ============================================================
+
+def print_confusion_matrix(
+    cm,
+):
+
+    print("\n")
+    print("CONFUSION MATRIX")
+    print("=" * 70)
+
+    print(
+        f"{'True / Pred':<18}"
+        + "".join(
+            f"{name:>14}"
+            for name in CLASS_NAMES
+        )
+    )
+
+    print("-" * 70)
+
+    for i, class_name in enumerate(
+        CLASS_NAMES
+    ):
+
+        row = (
+            f"{class_name:<18}"
+            + "".join(
+                f"{cm[i, j]:>14}"
+                for j in range(NUM_CLASSES)
+            )
+        )
+
+        print(row)
+
+    print("-" * 70)
+
+
+# ============================================================
+# Save Predictions
+# ============================================================
+
+def save_predictions(
+    y_true,
+    y_pred,
+    y_prob,
+    output_path,
+):
+
+    output_path = Path(
+        output_path
+    )
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    fieldnames = [
+        "sample_index",
+        "true_label",
+        "true_class",
+        "predicted_label",
+        "predicted_class",
+        "confidence",
+    ]
+
+    for class_name in CLASS_NAMES:
+
+        fieldnames.append(
+            f"prob_{class_name.lower().replace('-', '_')}"
+        )
+
+    with open(
+        output_path,
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fieldnames,
+        )
+
+        writer.writeheader()
+
+        for i in range(
+            len(y_true)
+        ):
+
+            predicted_probability = float(
+                y_prob[i, y_pred[i]]
+            )
+
+            row = {
+                "sample_index": i,
+                "true_label": int(
+                    y_true[i]
+                ),
+                "true_class": CLASS_NAMES[
+                    y_true[i]
+                ],
+                "predicted_label": int(
+                    y_pred[i]
+                ),
+                "predicted_class": CLASS_NAMES[
+                    y_pred[i]
+                ],
+                "confidence":
+                    predicted_probability,
+            }
+
+            for class_index, class_name in enumerate(
+                CLASS_NAMES
+            ):
+
+                column_name = (
+                    "prob_"
+                    + class_name.lower()
+                    .replace("-", "_")
+                )
+
+                row[column_name] = float(
+                    y_prob[
+                        i,
+                        class_index
+                    ]
+                )
+
+            writer.writerow(row)
+
+
+# ============================================================
+# Save Results
+# ============================================================
+
+def save_results(
+    metrics,
+    classwise,
+    cm,
+    output_path,
+):
+
+    output_path = Path(
+        output_path
+    )
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    results = {
+        "overall": {
+            key: (
+                None
+                if np.isnan(value)
+                else float(value)
+            )
+            for key, value in metrics.items()
+        },
+        "classwise": classwise,
+        "confusion_matrix": cm.tolist(),
+    }
+
+    with open(
+        output_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        json.dump(
+            results,
+            file,
+            indent=4,
+        )
+
+
+# ============================================================
+# Save Confusion Matrix
+# ============================================================
+
+def save_confusion_matrix(
+    cm,
+    output_path,
+):
+
+    output_path = Path(
+        output_path
+    )
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    np.savetxt(
+        output_path,
+        cm,
+        delimiter=",",
+        fmt="%d",
+    )
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate CSA-ViT on the "
+            "patient-level internal held-out test set."
+        )
+    )
+
+    # --------------------------------------------------------
+    # Dataset
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        required=True,
+        help="Root directory containing MRI data.",
+    )
+
+    parser.add_argument(
+        "--test_csv",
+        type=str,
+        required=True,
+        help=(
+            "CSV file containing ONLY the "
+            "patient-level held-out test split."
+        ),
+    )
+
+    # --------------------------------------------------------
+    # Checkpoint
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Path to csavit_best.pth.",
+    )
+
+    # --------------------------------------------------------
+    # Evaluation
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=32,
+    )
+
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+    )
+
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="results/test",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+    )
+
+    args = parser.parse_args()
+
+    # ========================================================
+    # Reproducibility
+    # ========================================================
+
+    set_seed(
+        args.seed
     )
 
     # ========================================================
-    # Load trained weights
+    # Device
+    # ========================================================
+
+    device = get_device()
+
+    print("=" * 70)
+    print("CSA-ViT TEST EVALUATION")
+    print("=" * 70)
+
+    print(
+        f"Device     : {device}"
+    )
+
+    if torch.cuda.is_available():
+
+        print(
+            f"GPU        : "
+            f"{torch.cuda.get_device_name(0)}"
+        )
+
+    print(
+        f"Checkpoint : "
+        f"{args.checkpoint}"
+    )
+
+    print(
+        f"Test CSV   : "
+        f"{args.test_csv}"
+    )
+
+    print("=" * 70)
+
+    # ========================================================
+    # Test Dataset
+    # ========================================================
+
+    test_dataset = BrainMRIDataset(
+        data_dir=args.data_dir,
+        csv_file=args.test_csv,
+        image_size=224,
+        train=False,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+    )
+
+    print(
+        f"\nTest samples: "
+        f"{len(test_dataset)}"
+    )
+
+    # ========================================================
+    # Build Model
+    # ========================================================
+
+    model = build_model()
+
+    # ========================================================
+    # Load Best Checkpoint
     # ========================================================
 
     model = load_checkpoint(
-        model,
-        args.checkpoint,
-        device
+        model=model,
+        checkpoint_path=args.checkpoint,
+        device=device,
     )
 
-    model.to(
+    model = model.to(
         device
     )
 
     model.eval()
 
+    print(
+        "\nBest CSA-ViT checkpoint loaded successfully."
+    )
+
     # ========================================================
-    # Run test
+    # Run Test
     # ========================================================
 
     (
         y_true,
         y_pred,
-        y_prob
+        y_prob,
     ) = run_test(
-        model,
-        test_loader,
-        device
+        model=model,
+        dataloader=test_loader,
+        device=device,
     )
 
     # ========================================================
-    # Calculate metrics
+    # Validate Number of Test Samples
+    # ========================================================
+
+    if len(y_true) != 270:
+
+        print(
+            "\nWARNING:"
+            f" Manuscript expects 270 test samples, "
+            f"but {len(y_true)} samples were evaluated."
+        )
+
+    else:
+
+        print(
+            "\nThe evaluation contains the "
+            "expected 270 held-out test samples."
+        )
+
+    # ========================================================
+    # Test Distribution
+    # ========================================================
+
+    validate_test_distribution(
+        y_true
+    )
+
+    # ========================================================
+    # Overall Metrics
     # ========================================================
 
     metrics = calculate_metrics(
-        y_true,
-        y_pred,
-        y_prob,
-        num_classes=4
+        y_true=y_true,
+        y_pred=y_pred,
+        y_prob=y_prob,
     )
-
-    # ========================================================
-    # Display overall metrics
-    # ========================================================
 
     print_overall_results(
         metrics
     )
 
     # ========================================================
-    # Class-wise metrics
+    # Class-wise Metrics
     # ========================================================
 
     classwise = calculate_classwise_metrics(
-        y_true,
-        y_pred,
-        class_names=CLASS_NAMES
+        y_true=y_true,
+        y_pred=y_pred,
     )
 
     print_classwise_results(
@@ -664,76 +1014,217 @@ print(
     )
 
     # ========================================================
-    # Output directory
-    # ========================================================
-
-    os.makedirs(
-        args.output_dir,
-        exist_ok=True
-    )
-
-    # ========================================================
-    # Save text results
-    # ========================================================
-
-    save_results(
-        metrics,
-        classwise,
-        os.path.join(
-            args.output_dir,
-            "test_results.txt"
-        )
-    )
-
-    # ========================================================
     # Confusion Matrix
     # ========================================================
 
-    cm = calculate_confusion_matrix(
+    cm = confusion_matrix(
         y_true,
         y_pred,
-        num_classes=4
-    )
-
-    np.savetxt(
-        os.path.join(
-            args.output_dir,
-            "confusion_matrix.csv"
+        labels=np.arange(
+            NUM_CLASSES
         ),
-        cm,
-        delimiter=",",
-        fmt="%d"
+    )
+
+    print_confusion_matrix(
+        cm
     )
 
     # ========================================================
-    # Confusion Matrix Figure
+    # Output Directory
     # ========================================================
 
-    plot_confusion_matrix(
-        cm,
-        class_names=CLASS_NAMES,
-        normalize=False,
-        save_path=os.path.join(
-            args.output_dir,
-            "confusion_matrix.png"
-        ),
-        title=(
-            "CSA-ViT Test-Set Confusion Matrix"
-        )
-    )
-
-    # ========================================================
-    # Final message
-    # ========================================================
-
-    print(
-        "\nTest evaluation completed."
-    )
-
-    print(
-        "Results saved to:",
+    output_dir = Path(
         args.output_dir
     )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # ========================================================
+    # Save Overall Results
+    # ========================================================
+
+    save_results(
+        metrics=metrics,
+        classwise=classwise,
+        cm=cm,
+        output_path=(
+            output_dir
+            / "test_results.json"
+        ),
+    )
+
+    # ========================================================
+    # Save Confusion Matrix
+    # ========================================================
+
+    save_confusion_matrix(
+        cm=cm,
+        output_path=(
+            output_dir
+            / "confusion_matrix.csv"
+        ),
+    )
+
+    # ========================================================
+    # Save Predictions and Probabilities
+    # ========================================================
+
+    save_predictions(
+        y_true=y_true,
+        y_pred=y_pred,
+        y_prob=y_prob,
+        output_path=(
+            output_dir
+            / "test_predictions.csv"
+        ),
+    )
+
+    # ========================================================
+    # Save Human-readable Results
+    # ========================================================
+
+    with open(
+        output_dir / "test_results.txt",
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        file.write(
+            "CSA-ViT Internal Held-out Test Results\n"
+        )
+
+        file.write(
+            "=" * 60 + "\n\n"
+        )
+
+        file.write(
+            f"Number of test samples: "
+            f"{len(y_true)}\n\n"
+        )
+
+        file.write(
+            f"Accuracy: "
+            f"{metrics['accuracy'] * 100:.4f}%\n"
+        )
+
+        file.write(
+            f"Macro Precision: "
+            f"{metrics['precision'] * 100:.4f}%\n"
+        )
+
+        file.write(
+            f"Macro Recall: "
+            f"{metrics['recall'] * 100:.4f}%\n"
+        )
+
+        file.write(
+            f"Macro F1: "
+            f"{metrics['f1'] * 100:.4f}%\n"
+        )
+
+        if np.isnan(
+            metrics["auc"]
+        ):
+
+            file.write(
+                "Macro One-vs-Rest AUC: N/A\n"
+            )
+
+        else:
+
+            file.write(
+                f"Macro One-vs-Rest AUC: "
+                f"{metrics['auc'] * 100:.4f}%\n"
+            )
+
+        file.write(
+            "\nClass-wise Results\n"
+        )
+
+        file.write(
+            "-" * 60 + "\n"
+        )
+
+        for class_name in CLASS_NAMES:
+
+            values = classwise[
+                class_name
+            ]
+
+            file.write(
+                f"\n{class_name}\n"
+            )
+
+            file.write(
+                f"Precision: "
+                f"{values['precision'] * 100:.4f}%\n"
+            )
+
+            file.write(
+                f"Recall: "
+                f"{values['recall'] * 100:.4f}%\n"
+            )
+
+            file.write(
+                f"F1-score: "
+                f"{values['f1'] * 100:.4f}%\n"
+            )
+
+            file.write(
+                f"Support: "
+                f"{values['support']}\n"
+            )
+
+        file.write(
+            "\nConfusion Matrix\n"
+        )
+
+        file.write(
+            str(cm)
+        )
+
+        file.write(
+            "\n"
+        )
+
+    # ========================================================
+    # Final Information
+    # ========================================================
+
+    print("\n")
+    print("=" * 70)
+    print("TEST EVALUATION COMPLETED")
+    print("=" * 70)
+
+    print(
+        f"Results directory : "
+        f"{output_dir}"
+    )
+
+    print(
+        f"Results JSON      : "
+        f"{output_dir / 'test_results.json'}"
+    )
+
+    print(
+        f"Results TXT       : "
+        f"{output_dir / 'test_results.txt'}"
+    )
+
+    print(
+        f"Predictions CSV   : "
+        f"{output_dir / 'test_predictions.csv'}"
+    )
+
+    print(
+        f"Confusion Matrix  : "
+        f"{output_dir / 'confusion_matrix.csv'}"
+    )
+
+    print("=" * 70)
 
 
 # ============================================================
@@ -741,5 +1232,4 @@ print(
 # ============================================================
 
 if __name__ == "__main__":
-
     main()
