@@ -1,575 +1,176 @@
-"""
-CSA-ViT Training Script
-=======================
 
-Training configuration follows the CSA-ViT manuscript.
-
-Dataset:
-    Multi-sequence MRI
-    T1, T1CE, T2, FLAIR
-
-Classes:
-    0 - Healthy
-    1 - Glioma
-    2 - Meningioma
-    3 - Pituitary Tumor
-
-Model:
-    CSA-ViT
-
-Configuration:
-    Input size          : 224 x 224
-    Embedding dimension : 256
-    Patch sizes         : 8, 16, 32
-    HCSAM blocks        : 6
-    Attention heads     : 8
-    Transformer layers  : 6
-    Dropout             : 0.1
-    Activation          : GELU
-
-Optimization:
-    Optimizer           : AdamW
-    Learning rate       : 1e-4
-    Weight decay        : 1e-4
-    Label smoothing     : 0.1
-    Scheduler           : Cosine Annealing
-    Batch size          : 32
-    Maximum epochs      : 100
-    Early stopping      : Enabled
-
-IMPORTANT:
-IMPORTANT:
-Patient-level train/validation/test assignments must be defined
-in the dataset manifest before training. The same patient must
-not occur in more than one split.
-''''
-
-import os
-import csv
 import argparse
+import csv
+import json
+import os
 import random
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
-
-from torch.utils.data import DataLoader
-
-"""
-CSA-ViT Training Script
-=======================
-
-Training configuration follows the CSA-ViT manuscript.
-
-Dataset:
-    Multi-sequence MRI
-    T1, T1CE, T2, FLAIR
-
-Classes:
-    0 - Healthy
-    1 - Glioma
-    2 - Meningioma
-    3 - Pituitary Tumor
-
-Model:
-    CSA-ViT
-
-Configuration:
-    Input size          : 224 x 224
-    Embedding dimension : 256
-    Patch sizes         : 8, 16, 32
-    HCSAM blocks        : 6
-    Attention heads     : 8
-    Transformer layers  : 6
-    Dropout             : 0.1
-    Activation          : GELU
-
-Optimization:
-    Optimizer           : AdamW
-    Learning rate       : 1e-4
-    Weight decay        : 1e-4
-    Label smoothing     : 0.1
-    Scheduler           : Cosine Annealing
-    Batch size          : 32
-    Maximum epochs      : 100
-    Early stopping      : Enabled
-
-IMPORTANT:
-Patient-level train/validation/test splitting should be
-performed before creating the CSV files used by this script.
-"""
-
-import os
-import csv
-import argparse
-import random
-
-import numpy as np
-import torch
-import torch.nn as nn
-
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from torch.utils.data import DataLoader
 
 from models.csavit import CSAViT
 from data.dataset import BrainMRIDataset
 
-from utils.metrics import (
-    calculate_metrics
-)
 
-from utils.visualization import (
-    plot_training_curves
-)
+CLASS_NAMES = [
+    "No-tumor",
+    "Glioma",
+    "Meningioma",
+    "Pituitary",
+]
+
+NUM_CLASSES = 4
+SEEDS = [42, 52, 62, 72, 82]
 
 
-# ============================================================
-# Reproducibility
-# ============================================================
-
-def set_seed(
-    seed=42
-):
-    """
-    Set random seeds for reproducible experiments.
-    """
-
-    random.seed(
-        seed
-    )
-
-    np.random.seed(
-        seed
-    )
-
-    torch.manual_seed(
-        seed
-    )
+def set_seed(seed: int) -> None:
+    """Set random seeds for reproducible runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
     if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
-        torch.cuda.manual_seed(
-            seed
-        )
-
-        torch.cuda.manual_seed_all(
-            seed
-        )
-
-    # --------------------------------------------------------
-    # Deterministic behavior
-    # --------------------------------------------------------
-
+    # The manuscript evaluates repeated independent runs.
+    # Deterministic settings improve reproducibility.
     torch.backends.cudnn.deterministic = True
-
     torch.backends.cudnn.benchmark = False
 
 
-# ============================================================
-# Device
-# ============================================================
+def get_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def get_device():
 
-    if torch.cuda.is_available():
+def extract_logits(output):
+    """Support models returning either logits or {'logits': logits}."""
+    if isinstance(output, dict):
+        return output["logits"]
+    return output
 
-        return torch.device(
-            "cuda"
+
+def compute_metrics(y_true, y_pred, y_prob):
+    """Compute manuscript-reported classification metrics."""
+    metrics = {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision": precision_score(
+            y_true, y_pred, average="macro", zero_division=0
+        ),
+        "recall": recall_score(
+            y_true, y_pred, average="macro", zero_division=0
+        ),
+        "f1": f1_score(
+            y_true, y_pred, average="macro", zero_division=0
+        ),
+    }
+
+    try:
+        metrics["auc"] = roc_auc_score(
+            y_true,
+            y_prob,
+            multi_class="ovr",
+            average="macro",
+            labels=np.arange(NUM_CLASSES),
         )
+    except ValueError:
+        # AUC is undefined if a validation split does not contain
+        # all four classes. Training can continue, but this should
+        # not occur for the manuscript's intended split.
+        metrics["auc"] = float("nan")
 
-    return torch.device(
-        "cpu"
-    )
+    return metrics
 
 
-# ============================================================
-# Training One Epoch
-# ============================================================
+def run_epoch(model, loader, criterion, optimizer, device, training):
+    """Run one training or validation epoch."""
+    if training:
+        model.train()
+    else:
+        model.eval()
 
-def train_one_epoch(
-    model,
-    dataloader,
-    optimizer,
-    criterion,
-    device
-):
-    """
-    Train CSA-ViT for one epoch.
-    """
+    total_loss = 0.0
+    y_true = []
+    y_pred = []
+    y_prob = []
 
-    model.train()
+    context = torch.enable_grad() if training else torch.no_grad()
 
-    running_loss = 0.0
+    with context:
+        for images, labels in loader:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
-    all_labels = []
-    all_predictions = []
-    all_probabilities = []
+            if training:
+                optimizer.zero_grad(set_to_none=True)
 
-    for batch in dataloader:
+            logits = extract_logits(model(images))
+            loss = criterion(logits, labels)
 
-        images = batch[0]
+            if training:
+                loss.backward()
+                optimizer.step()
 
-        labels = batch[1]
+            total_loss += loss.item() * images.size(0)
 
-        images = images.to(
-            device,
-            non_blocking=True
-        )
+            probabilities = torch.softmax(logits, dim=1)
+            predictions = torch.argmax(probabilities, dim=1)
 
-        labels = labels.to(
-            device,
-            non_blocking=True
-        )
+            y_true.extend(labels.detach().cpu().numpy().tolist())
+            y_pred.extend(predictions.detach().cpu().numpy().tolist())
+            y_prob.append(probabilities.detach().cpu())
 
-        # ----------------------------------------------------
-        # Clear gradients
-        # ----------------------------------------------------
+    epoch_loss = total_loss / len(loader.dataset)
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    y_prob = torch.cat(y_prob, dim=0).numpy()
 
-        optimizer.zero_grad(
-            set_to_none=True
-        )
+    metrics = compute_metrics(y_true, y_pred, y_prob)
 
-        # ----------------------------------------------------
-        # Forward pass
-        # ----------------------------------------------------
+    return epoch_loss, metrics, y_true, y_pred, y_prob
 
-        output = model(
-            images
-        )
-
-        if isinstance(
-            output,
-            dict
-        ):
-
-            logits = output[
-                "logits"
-            ]
-
-        else:
-
-            logits = output
-
-        # ----------------------------------------------------
-        # Loss
-        # ----------------------------------------------------
-
-        loss = criterion(
-            logits,
-            labels
-        )
-
-        # ----------------------------------------------------
-        # Backpropagation
-        # ----------------------------------------------------
-
-        loss.backward()
-
-        # ----------------------------------------------------
-        # Parameter update
-        # ----------------------------------------------------
-
-        optimizer.step()
-
-        # ----------------------------------------------------
-        # Statistics
-        # ----------------------------------------------------
-
-        batch_size = (
-            images.size(0)
-        )
-
-        running_loss += (
-            loss.item() *
-            batch_size
-        )
-
-        probabilities = torch.softmax(
-            logits,
-            dim=1
-        )
-
-        predictions = torch.argmax(
-            probabilities,
-            dim=1
-        )
-
-        all_labels.extend(
-            labels.detach()
-            .cpu()
-            .numpy()
-        )
-
-        all_predictions.extend(
-            predictions.detach()
-            .cpu()
-            .numpy()
-        )
-
-        all_probabilities.append(
-            probabilities.detach()
-            .cpu()
-        )
-
-    # --------------------------------------------------------
-    # Average loss
-    # --------------------------------------------------------
-
-    epoch_loss = (
-        running_loss /
-        len(dataloader.dataset)
-    )
-
-    # --------------------------------------------------------
-    # Metrics
-    # --------------------------------------------------------
-
-    y_true = np.asarray(
-        all_labels
-    )
-
-    y_pred = np.asarray(
-        all_predictions
-    )
-
-    y_prob = torch.cat(
-        all_probabilities,
-        dim=0
-    ).numpy()
-
-    metrics = calculate_metrics(
-        y_true,
-        y_pred,
-        y_prob,
-        num_classes=4
-    )
-
-    return (
-        epoch_loss,
-        metrics
-    )
-
-
-# ============================================================
-# Validation
-# ============================================================
-
-@torch.no_grad()
-def validate(
-    model,
-    dataloader,
-    criterion,
-    device
-):
-    """
-    Validate CSA-ViT.
-    """
-
-    model.eval()
-
-    running_loss = 0.0
-
-    all_labels = []
-    all_predictions = []
-    all_probabilities = []
-
-    for batch in dataloader:
-
-        images = batch[0]
-
-        labels = batch[1]
-
-        images = images.to(
-            device,
-            non_blocking=True
-        )
-
-        labels = labels.to(
-            device,
-            non_blocking=True
-        )
-
-        # ----------------------------------------------------
-        # Forward
-        # ----------------------------------------------------
-
-        output = model(
-            images
-        )
-
-        if isinstance(
-            output,
-            dict
-        ):
-
-            logits = output[
-                "logits"
-            ]
-
-        else:
-
-            logits = output
-
-        # ----------------------------------------------------
-        # Loss
-        # ----------------------------------------------------
-
-        loss = criterion(
-            logits,
-            labels
-        )
-
-        batch_size = (
-            images.size(0)
-        )
-
-        running_loss += (
-            loss.item() *
-            batch_size
-        )
-
-        # ----------------------------------------------------
-        # Probabilities
-        # ----------------------------------------------------
-
-        probabilities = torch.softmax(
-            logits,
-            dim=1
-        )
-
-        predictions = torch.argmax(
-            probabilities,
-            dim=1
-        )
-
-        all_labels.extend(
-            labels.cpu()
-            .numpy()
-        )
-
-        all_predictions.extend(
-            predictions.cpu()
-            .numpy()
-        )
-
-        all_probabilities.append(
-            probabilities.cpu()
-        )
-
-    # --------------------------------------------------------
-    # Loss
-    # --------------------------------------------------------
-
-    epoch_loss = (
-        running_loss /
-        len(dataloader.dataset)
-    )
-
-    # --------------------------------------------------------
-    # Metrics
-    # --------------------------------------------------------
-
-    y_true = np.asarray(
-        all_labels
-    )
-
-    y_pred = np.asarray(
-        all_predictions
-    )
-
-    y_prob = torch.cat(
-        all_probabilities,
-        dim=0
-    ).numpy()
-
-    metrics = calculate_metrics(
-        y_true,
-        y_pred,
-        y_prob,
-        num_classes=4
-    )
-
-    return (
-        epoch_loss,
-        metrics
-    )
-
-
-# ============================================================
-# Save Checkpoint
-# ============================================================
 
 def save_checkpoint(
+    path,
     model,
     optimizer,
     scheduler,
     epoch,
-    metrics,
-    path
+    seed,
+    val_loss,
+    val_metrics,
 ):
-    """
-    Save the best CSA-ViT model checkpoint.
-    """
-
-    directory = os.path.dirname(
-        path
-    )
-
-    if directory:
-
-        os.makedirs(
-            directory,
-            exist_ok=True
-        )
-
+    """Save the checkpoint corresponding to the lowest validation loss."""
     torch.save(
         {
             "epoch": epoch,
-
-            "model_state_dict":
-                model.state_dict(),
-
-            "optimizer_state_dict":
-                optimizer.state_dict(),
-
-            "scheduler_state_dict":
-                scheduler.state_dict(),
-
-            "metrics":
-                metrics
+            "seed": seed,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "val_loss": val_loss,
+            "val_metrics": val_metrics,
+            "class_names": CLASS_NAMES,
         },
-        path
+        path,
     )
 
 
-# ============================================================
-# Save Training History
-# ============================================================
-
-def save_history(
-    history,
-    path
-):
-    """
-    Save training history as CSV.
-    """
-
-    directory = os.path.dirname(
-        path
-    )
-
-    if directory:
-
-        os.makedirs(
-            directory,
-            exist_ok=True
-        )
-
-    number_epochs = len(
-        history["train_loss"]
-    )
-
+def save_history(history, path):
+    """Save epoch-wise training/validation history."""
     fieldnames = [
         "epoch",
+        "learning_rate",
         "train_loss",
         "val_loss",
         "train_accuracy",
@@ -581,311 +182,22 @@ def save_history(
         "train_f1",
         "val_f1",
         "train_auc",
-        "val_auc"
+        "val_auc",
     ]
 
-    with open(
-        path,
-        "w",
-        newline="",
-        encoding="utf-8"
-    ) as file:
-
-        writer = csv.DictWriter(
-            file,
-            fieldnames=fieldnames
-        )
-
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
+        for row in history:
+            writer.writerow(row)
 
-        for i in range(
-            number_epochs
-        ):
 
-            writer.writerow(
-                {
-                    "epoch":
-                        i + 1,
+def build_model():
+    """
+    Construct CSA-ViT using the architecture reported in the manuscript.
 
-                    "train_loss":
-                        history["train_loss"][i],
-
-                    "val_loss":
-                        history["val_loss"][i],
-
-                    "train_accuracy":
-                        history["train_accuracy"][i],
-
-                    "val_accuracy":
-                        history["val_accuracy"][i],
-
-                    "train_precision":
-                        history["train_precision"][i],
-
-                    "val_precision":
-                        history["val_precision"][i],
-
-                    "train_recall":
-                        history["train_recall"][i],
-
-                    "val_recall":
-                        history["val_recall"][i],
-
-                    "train_f1":
-                        history["train_f1"][i],
-
-                    "val_f1":
-                        history["val_f1"][i],
-
-                    "train_auc":
-                        history["train_auc"][i],
-
-                    "val_auc":
-                        history["val_auc"][i]
-                }
-            )
-
-
-# ============================================================
-# Main Training Function
-# ============================================================
-
-def main():
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Train CSA-ViT on multi-sequence "
-            "brain MRI data."
-        )
-    )
-
-    # --------------------------------------------------------
-    # Dataset arguments
-    # --------------------------------------------------------
-
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        required=True,
-        help="Root directory containing MRI images."
-    )
-
-  parser.add_argument(
-    "--csv_file",
-    type=str,
-    required=True,
-    help=(
-        "Patient-level CSV manifest containing "
-        "train, validation, and test assignments."
-    )
-  )
-
-    # --------------------------------------------------------
-    # Training arguments
-    # --------------------------------------------------------
-
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=32
-    )
-
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=100
-    )
-
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=1e-4
-    )
-
-    parser.add_argument(
-        "--weight_decay",
-        type=float,
-        default=1e-4
-    )
-
-    parser.add_argument(
-        "--label_smoothing",
-        type=float,
-        default=0.1
-    )
-
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=4
-    )
-
-    parser.add_argument(
-        "--patience",
-        type=int,
-        default=15
-    )
-
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42
-    )
-
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="results/training"
-    )
-
-    args = parser.parse_args()
-
-    # ========================================================
-    # Reproducibility
-    # ========================================================
-
-    set_seed(
-        args.seed
-    )
-
-    # ========================================================
-    # Device
-    # ========================================================
-
-    device = get_device()
-
-    print(
-        "\nDevice:",
-        device
-    )
-
-    if torch.cuda.is_available():
-
-        print(
-            "GPU:",
-            torch.cuda.get_device_name(0)
-        )
-
-    # ========================================================
-    # Output directory
-    # ========================================================
-
-    os.makedirs(
-        args.output_dir,
-        exist_ok=True
-    )
-
-    checkpoint_dir = os.path.join(
-        args.output_dir,
-        "checkpoints"
-    )
-
-    os.makedirs(
-        checkpoint_dir,
-        exist_ok=True
-    )
-
-    # ========================================================
-    # Training Dataset
-    # ========================================================
-
-   # ========================================================
-# Load Patient-Level Dataset Manifest
-# ========================================================
-
-manifest = load_manifest(
-    args.csv_file
-)
-
-# --------------------------------------------------------
-# Verify patient-level partitioning
-# --------------------------------------------------------
-
-check_patient_leakage(
-    manifest
-)
-
-# --------------------------------------------------------
-# Print dataset summary
-# --------------------------------------------------------
-
-dataset_summary(
-    manifest
-)
-
-# --------------------------------------------------------
-# Obtain training split
-# --------------------------------------------------------
-
-train_df = get_split(
-    manifest,
-    "train"
-)
-
-# --------------------------------------------------------
-# Create training dataset
-# --------------------------------------------------------
-
-train_dataset = MultiSequenceNPZDataset(
-    dataframe=train_df,
-    image_size=224
-)
-
-    # ========================================================
-    # Validation Dataset
-    # ========================================================
-
-    val_dataset = BrainMRIDataset(
-        data_dir=args.data_dir,
-        csv_file=args.val_csv,
-        image_size=224,
-        train=False
-    )
-
-    # ========================================================
-    # DataLoaders
-    # ========================================================
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False
-    )
-
-   print(
-    f"Training samples : {len(train_dataset)}"
-)
-
-print(
-    f"Training patients: "
-    f"{train_df['patient_id'].nunique()}"
-)
-
-print(
-    f"Validation samples : {len(val_dataset)}"
-)
-
-print(
-    f"Validation patients: "
-    f"{val_df['patient_id'].nunique()}"
-)
-
-    # ========================================================
-    # CSA-ViT Model
-    # ========================================================
-
+    The exact CSAViT implementation belongs in models/csavit.py.
+    """
     model = CSAViT(
         in_channels=4,
         stem_channels=(64, 128),
@@ -895,1078 +207,83 @@ print(
         heads=8,
         transformer_layers=6,
         dropout=0.1,
-        num_classes=4
+        num_classes=NUM_CLASSES,
     )
+    return model
 
-    model = model.to(
-        device
-    )
-
-    # ========================================================
-    # Loss
-    # ========================================================
-
-    criterion = nn.CrossEntropyLoss(
-        label_smoothing=args.label_smoothing
-    )
-
-    # ========================================================
-    # AdamW Optimizer
-    # ========================================================
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-        betas=(0.9, 0.999)
-    )
-
-    # ========================================================
-    # Cosine Annealing Scheduler
-    # ========================================================
-
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs
-    )
-
-    # ========================================================
-    # Training History
-    # ========================================================
-
-    history = {
-        "train_loss": [],
-        "val_loss": [],
-
-        "train_accuracy": [],
-        "val_accuracy": [],
-
-        "train_precision": [],
-        "val_precision": [],
-
-        "train_recall": [],
-        "val_recall": [],
-
-        "train_f1": [],
-        "val_f1": [],
-
-        "train_auc": [],
-        "val_auc": []
-    }
-
-    # ========================================================
-    # Early Stopping
-    # ========================================================
-
-    best_val_accuracy = -np.inf
-
-    best_epoch = 0
-
-    epochs_without_improvement = 0
-
-    # ========================================================
-    # Training Loop
-    # ========================================================
-
-    for epoch in range(
-        args.epochs
-    ):
-
-        print(
-            "\n"
-            + "=" * 70
-        )
-
-        print(
-            f"Epoch "
-            f"{epoch + 1}/{args.epochs}"
-        )
-
-        print(
-            "=" * 70
-        )
-
-        # ----------------------------------------------------
-        # Training
-        # ----------------------------------------------------
-
-        train_loss, train_metrics = (
-            train_one_epoch(
-                model,
-                train_loader,
-                optimizer,
-                criterion,
-                device
-            )
-        )
-
-        # ----------------------------------------------------
-        # Validation
-        # ----------------------------------------------------
-
-        val_loss, val_metrics = (
-            validate(
-                model,
-                val_loader,
-                criterion,
-                device
-            )
-        )
-
-        # ----------------------------------------------------
-        # Scheduler
-        # ----------------------------------------------------
-
-        scheduler.step()
-
-        # ----------------------------------------------------
-        # Store history
-        # ----------------------------------------------------
-
-        history["train_loss"].append(
-            train_loss
-        )
-
-        history["val_loss"].append(
-            val_loss
-        )
-
-        history["train_accuracy"].append(
-            train_metrics["accuracy"]
-        )
-
-        history["val_accuracy"].append(
-            val_metrics["accuracy"]
-        )
-
-        history["train_precision"].append(
-            train_metrics["precision"]
-        )
-
-        history["val_precision"].append(
-            val_metrics["precision"]
-        )
-
-        history["train_recall"].append(
-            train_metrics["recall"]
-        )
-
-        history["val_recall"].append(
-            val_metrics["recall"]
-        )
-
-        history["train_f1"].append(
-            train_metrics["f1_score"]
-        )
-
-        history["val_f1"].append(
-            val_metrics["f1_score"]
-        )
-
-        history["train_auc"].append(
-            train_metrics["auc"]
-        )
-
-        history["val_auc"].append(
-            val_metrics["auc"]
-        )
-
-        # ----------------------------------------------------
-        # Current learning rate
-        # ----------------------------------------------------
-
-        current_lr = (
-            optimizer.param_groups[0]["lr"]
-        )
-
-        # ----------------------------------------------------
-        # Display results
-        # ----------------------------------------------------
-
-        print(
-            f"Learning Rate : "
-            f"{current_lr:.8f}"
-        )
-
-        print(
-            f"Train Loss    : "
-            f"{train_loss:.5f}"
-        )
-
-        print(
-            f"Val Loss      : "
-            f"{val_loss:.5f}"
-        )
-
-        print(
-            f"Train Accuracy: "
-            f"{train_metrics['accuracy'] * 100:.2f}%"
-        )
-
-        print(
-            f"Val Accuracy  : "
-            f"{val_metrics['accuracy'] * 100:.2f}%"
-        )
-
-        print(
-            f"Train F1      : "
-            f"{train_metrics['f1_score'] * 100:.2f}%"
-        )
-
-        print(
-            f"Val F1        : "
-            f"{val_metrics['f1_score'] * 100:.2f}%"
-        )
-
-        # ----------------------------------------------------
-        # Checkpoint
-        # ----------------------------------------------------
-
-        if (
-            val_metrics["accuracy"]
-            >
-            best_val_accuracy
-        ):
-
-            best_val_accuracy = (
-                val_metrics["accuracy"]
-            )
-
-            best_epoch = (
-                epoch + 1
-            )
-
-            epochs_without_improvement = 0
-
-            checkpoint_path = os.path.join(
-                checkpoint_dir,
-                "csavit_best.pth"
-            )
-
-            save_checkpoint(
-                model,
-                optimizer,
-                scheduler,
-                epoch + 1,
-                val_metrics,
-                checkpoint_path
-            )
-
-            print(
-                "\nBest model saved."
-            )
-
-        else:
-
-            epochs_without_improvement += 1
-
-        # ----------------------------------------------------
-        # Early stopping
-        # ----------------------------------------------------
-
-        if (
-            epochs_without_improvement
-            >= args.patience
-        ):
-
-            print(
-                "\nEarly stopping triggered."
-            )
-
-            break
-
-    # ========================================================
-    # Save Final Model
-    # ========================================================
-
-    final_checkpoint = os.path.join(
-        checkpoint_dir,
-        "csavit_final.pth"
-    )
-
-    save_checkpoint(
-        model,
-        optimizer,
-        scheduler,
-        epoch + 1,
-        val_metrics,
-        final_checkpoint
-    )
-
-    # ========================================================
-    # Save History
-    # ========================================================
-
-    history_path = os.path.join(
-        args.output_dir,
-        "training_history.csv"
-    )
-
-    save_history(
-        history,
-        history_path
-    )
-
-    # ========================================================
-    # Training Curves
-    # ========================================================
-
-    plot_training_curves(
-        history,
-        save_directory=os.path.join(
-            args.output_dir,
-            "figures"
-        ),
-        show=False
-    )
-
-    # ========================================================
-    # Final Information
-    # ========================================================
-
-    print(
-        "\n"
-        + "=" * 70
-    )
-
-    print(
-        "Training completed."
-    )
-
-    print(
-        f"Best validation accuracy: "
-        f"{best_val_accuracy * 100:.2f}%"
-    )
-
-    print(
-        f"Best epoch: "
-        f"{best_epoch}"
-    )
-
-    print(
-        f"Best checkpoint: "
-        f"{os.path.join(checkpoint_dir, 'csavit_best.pth')}"
-    )
-
-    print(
-        f"Training history: "
-        f"{history_path}"
-    )
-
-    print(
-        "=" * 70
-    )
-
-
-# ============================================================
-# Entry Point
-# ============================================================
-
-if __name__ == "__main__":
-
-    main()
-
-from utils.metrics import (
-    calculate_metrics
-)
-
-from utils.visualization import (
-    plot_training_curves
-)
-
-
-# ============================================================
-# Reproducibility
-# ============================================================
-
-def set_seed(
-    seed=42
-):
-    """
-    Set random seeds for reproducible experiments.
-    """
-
-    random.seed(
-        seed
-    )
-
-    np.random.seed(
-        seed
-    )
-
-    torch.manual_seed(
-        seed
-    )
-
-    if torch.cuda.is_available():
-
-        torch.cuda.manual_seed(
-            seed
-        )
-
-        torch.cuda.manual_seed_all(
-            seed
-        )
-
-    # --------------------------------------------------------
-    # Deterministic behavior
-    # --------------------------------------------------------
-
-    torch.backends.cudnn.deterministic = True
-
-    torch.backends.cudnn.benchmark = False
-
-
-# ============================================================
-# Device
-# ============================================================
-
-def get_device():
-
-    if torch.cuda.is_available():
-
-        return torch.device(
-            "cuda"
-        )
-
-    return torch.device(
-        "cpu"
-    )
-
-
-# ============================================================
-# Training One Epoch
-# ============================================================
-
-def train_one_epoch(
-    model,
-    dataloader,
-    optimizer,
-    criterion,
-    device
-):
-    """
-    Train CSA-ViT for one epoch.
-    """
-
-    model.train()
-
-    running_loss = 0.0
-
-    all_labels = []
-    all_predictions = []
-    all_probabilities = []
-
-    for batch in dataloader:
-
-        images = batch[0]
-
-        labels = batch[1]
-
-        images = images.to(
-            device,
-            non_blocking=True
-        )
-
-        labels = labels.to(
-            device,
-            non_blocking=True
-        )
-
-        # ----------------------------------------------------
-        # Clear gradients
-        # ----------------------------------------------------
-
-        optimizer.zero_grad(
-            set_to_none=True
-        )
-
-        # ----------------------------------------------------
-        # Forward pass
-        # ----------------------------------------------------
-
-        output = model(
-            images
-        )
-
-        if isinstance(
-            output,
-            dict
-        ):
-
-            logits = output[
-                "logits"
-            ]
-
-        else:
-
-            logits = output
-
-        # ----------------------------------------------------
-        # Loss
-        # ----------------------------------------------------
-
-        loss = criterion(
-            logits,
-            labels
-        )
-
-        # ----------------------------------------------------
-        # Backpropagation
-        # ----------------------------------------------------
-
-        loss.backward()
-
-        # ----------------------------------------------------
-        # Parameter update
-        # ----------------------------------------------------
-
-        optimizer.step()
-
-        # ----------------------------------------------------
-        # Statistics
-        # ----------------------------------------------------
-
-        batch_size = (
-            images.size(0)
-        )
-
-        running_loss += (
-            loss.item() *
-            batch_size
-        )
-
-        probabilities = torch.softmax(
-            logits,
-            dim=1
-        )
-
-        predictions = torch.argmax(
-            probabilities,
-            dim=1
-        )
-
-        all_labels.extend(
-            labels.detach()
-            .cpu()
-            .numpy()
-        )
-
-        all_predictions.extend(
-            predictions.detach()
-            .cpu()
-            .numpy()
-        )
-
-        all_probabilities.append(
-            probabilities.detach()
-            .cpu()
-        )
-
-    # --------------------------------------------------------
-    # Average loss
-    # --------------------------------------------------------
-
-    epoch_loss = (
-        running_loss /
-        len(dataloader.dataset)
-    )
-
-    # --------------------------------------------------------
-    # Metrics
-    # --------------------------------------------------------
-
-    y_true = np.asarray(
-        all_labels
-    )
-
-    y_pred = np.asarray(
-        all_predictions
-    )
-
-    y_prob = torch.cat(
-        all_probabilities,
-        dim=0
-    ).numpy()
-
-    metrics = calculate_metrics(
-        y_true,
-        y_pred,
-        y_prob,
-        num_classes=4
-    )
-
-    return (
-        epoch_loss,
-        metrics
-    )
-
-
-# ============================================================
-# Validation
-# ============================================================
-
-@torch.no_grad()
-def validate(
-    model,
-    dataloader,
-    criterion,
-    device
-):
-    """
-    Validate CSA-ViT.
-    """
-
-    model.eval()
-
-    running_loss = 0.0
-
-    all_labels = []
-    all_predictions = []
-    all_probabilities = []
-
-    for batch in dataloader:
-
-        images = batch[0]
-
-        labels = batch[1]
-
-        images = images.to(
-            device,
-            non_blocking=True
-        )
-
-        labels = labels.to(
-            device,
-            non_blocking=True
-        )
-
-        # ----------------------------------------------------
-        # Forward
-        # ----------------------------------------------------
-
-        output = model(
-            images
-        )
-
-        if isinstance(
-            output,
-            dict
-        ):
-
-            logits = output[
-                "logits"
-            ]
-
-        else:
-
-            logits = output
-
-        # ----------------------------------------------------
-        # Loss
-        # ----------------------------------------------------
-
-        loss = criterion(
-            logits,
-            labels
-        )
-
-        batch_size = (
-            images.size(0)
-        )
-
-        running_loss += (
-            loss.item() *
-            batch_size
-        )
-
-        # ----------------------------------------------------
-        # Probabilities
-        # ----------------------------------------------------
-
-        probabilities = torch.softmax(
-            logits,
-            dim=1
-        )
-
-        predictions = torch.argmax(
-            probabilities,
-            dim=1
-        )
-
-        all_labels.extend(
-            labels.cpu()
-            .numpy()
-        )
-
-        all_predictions.extend(
-            predictions.cpu()
-            .numpy()
-        )
-
-        all_probabilities.append(
-            probabilities.cpu()
-        )
-
-    # --------------------------------------------------------
-    # Loss
-    # --------------------------------------------------------
-
-    epoch_loss = (
-        running_loss /
-        len(dataloader.dataset)
-    )
-
-    # --------------------------------------------------------
-    # Metrics
-    # --------------------------------------------------------
-
-    y_true = np.asarray(
-        all_labels
-    )
-
-    y_pred = np.asarray(
-        all_predictions
-    )
-
-    y_prob = torch.cat(
-        all_probabilities,
-        dim=0
-    ).numpy()
-
-    metrics = calculate_metrics(
-        y_true,
-        y_pred,
-        y_prob,
-        num_classes=4
-    )
-
-    return (
-        epoch_loss,
-        metrics
-    )
-
-
-# ============================================================
-# Save Checkpoint
-# ============================================================
-
-def save_checkpoint(
-    model,
-    optimizer,
-    scheduler,
-    epoch,
-    metrics,
-    path
-):
-    """
-    Save the best CSA-ViT model checkpoint.
-    """
-
-    directory = os.path.dirname(
-        path
-    )
-
-    if directory:
-
-        os.makedirs(
-            directory,
-            exist_ok=True
-        )
-
-    torch.save(
-        {
-            "epoch": epoch,
-
-            "model_state_dict":
-                model.state_dict(),
-
-            "optimizer_state_dict":
-                optimizer.state_dict(),
-
-            "scheduler_state_dict":
-                scheduler.state_dict(),
-
-            "metrics":
-                metrics
-        },
-        path
-    )
-
-
-# ============================================================
-# Save Training History
-# ============================================================
-
-def save_history(
-    history,
-    path
-):
-    """
-    Save training history as CSV.
-    """
-
-    directory = os.path.dirname(
-        path
-    )
-
-    if directory:
-
-        os.makedirs(
-            directory,
-            exist_ok=True
-        )
-
-    number_epochs = len(
-        history["train_loss"]
-    )
-
-    fieldnames = [
-        "epoch",
-        "train_loss",
-        "val_loss",
-        "train_accuracy",
-        "val_accuracy",
-        "train_precision",
-        "val_precision",
-        "train_recall",
-        "val_recall",
-        "train_f1",
-        "val_f1",
-        "train_auc",
-        "val_auc"
-    ]
-
-    with open(
-        path,
-        "w",
-        newline="",
-        encoding="utf-8"
-    ) as file:
-
-        writer = csv.DictWriter(
-            file,
-            fieldnames=fieldnames
-        )
-
-        writer.writeheader()
-
-        for i in range(
-            number_epochs
-        ):
-
-            writer.writerow(
-                {
-                    "epoch":
-                        i + 1,
-
-                    "train_loss":
-                        history["train_loss"][i],
-
-                    "val_loss":
-                        history["val_loss"][i],
-
-                    "train_accuracy":
-                        history["train_accuracy"][i],
-
-                    "val_accuracy":
-                        history["val_accuracy"][i],
-
-                    "train_precision":
-                        history["train_precision"][i],
-
-                    "val_precision":
-                        history["val_precision"][i],
-
-                    "train_recall":
-                        history["train_recall"][i],
-
-                    "val_recall":
-                        history["val_recall"][i],
-
-                    "train_f1":
-                        history["train_f1"][i],
-
-                    "val_f1":
-                        history["val_f1"][i],
-
-                    "train_auc":
-                        history["train_auc"][i],
-
-                    "val_auc":
-                        history["val_auc"][i]
-                }
-            )
-
-
-# ============================================================
-# Main Training Function
-# ============================================================
 
 def main():
-
     parser = argparse.ArgumentParser(
-        description=(
-            "Train CSA-ViT on multi-sequence "
-            "brain MRI data."
-        )
+        description="Train CSA-ViT on patient-level multi-sequence MRI data."
     )
 
-    # --------------------------------------------------------
-    # Dataset arguments
-    # --------------------------------------------------------
+    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--train_csv", type=str, required=True)
+    parser.add_argument("--val_csv", type=str, required=True)
 
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        required=True,
-        help="Root directory containing MRI images."
-    )
-
-    parser.add_argument(
-        "--train_csv",
-        type=str,
-        required=True,
-        help="Patient-level training split CSV."
-    )
-
-    parser.add_argument(
-        "--val_csv",
-        type=str,
-        required=True,
-        help="Patient-level validation split CSV."
-    )
-
-    # --------------------------------------------------------
-    # Training arguments
-    # --------------------------------------------------------
-
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=32
-    )
-
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=100
-    )
-
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=1e-4
-    )
-
-    parser.add_argument(
-        "--weight_decay",
-        type=float,
-        default=1e-4
-    )
-
-    parser.add_argument(
-        "--label_smoothing",
-        type=float,
-        default=0.1
-    )
-
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=4
-    )
-
-    parser.add_argument(
-        "--patience",
-        type=int,
-        default=15
-    )
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--label_smoothing", type=float, default=0.1)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--num_workers", type=int, default=4)
 
     parser.add_argument(
         "--seed",
         type=int,
-        default=42
+        default=42,
+        choices=SEEDS,
+        help="One of the five manuscript seeds: 42, 52, 62, 72, 82.",
     )
 
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="results/training"
+        default="results/csavit",
     )
 
     args = parser.parse_args()
 
-    # ========================================================
-    # Reproducibility
-    # ========================================================
-
-    set_seed(
-        args.seed
-    )
-
-    # ========================================================
-    # Device
-    # ========================================================
-
+    set_seed(args.seed)
     device = get_device()
 
-    print(
-        "\nDevice:",
-        device
-    )
+    output_dir = Path(args.output_dir) / f"seed_{args.seed}"
+    checkpoint_dir = output_dir / "checkpoints"
+    figure_dir = output_dir / "figures"
 
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    figure_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 72)
+    print("CSA-ViT TRAINING")
+    print("=" * 72)
+    print(f"Device       : {device}")
     if torch.cuda.is_available():
+        print(f"GPU          : {torch.cuda.get_device_name(0)}")
+    print(f"Seed         : {args.seed}")
+    print(f"Batch size   : {args.batch_size}")
+    print(f"Max epochs   : {args.epochs}")
+    print(f"Learning rate: {args.learning_rate}")
+    print(f"Weight decay : {args.weight_decay}")
+    print(f"Patience     : {args.patience}")
+    print("=" * 72)
 
-        print(
-            "GPU:",
-            torch.cuda.get_device_name(0)
-        )
-
-    # ========================================================
-    # Output directory
-    # ========================================================
-
-    os.makedirs(
-        args.output_dir,
-        exist_ok=True
-    )
-
-    checkpoint_dir = os.path.join(
-        args.output_dir,
-        "checkpoints"
-    )
-
-    os.makedirs(
-        checkpoint_dir,
-        exist_ok=True
-    )
-
-    # ========================================================
-    # Training Dataset
-    # ========================================================
-
+    # Patient-level split manifests are supplied explicitly.
+    # The same patient must never occur in both train and validation CSVs.
     train_dataset = BrainMRIDataset(
         data_dir=args.data_dir,
         csv_file=args.train_csv,
         image_size=224,
-        train=True
+        train=True,
     )
-
-    # ========================================================
-    # Validation Dataset
-    # ========================================================
 
     val_dataset = BrainMRIDataset(
         data_dir=args.data_dir,
         csv_file=args.val_csv,
         image_size=224,
-        train=False
+        train=False,
     )
-
-    # ========================================================
-    # DataLoaders
-    # ========================================================
 
     train_loader = DataLoader(
         train_dataset,
@@ -1974,7 +291,7 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
-        drop_last=False
+        drop_last=False,
     )
 
     val_loader = DataLoader(
@@ -1983,399 +300,159 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
-        drop_last=False
+        drop_last=False,
     )
 
-    print(
-        f"Training samples: "
-        f"{len(train_dataset)}"
-    )
+    print(f"Training samples  : {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
 
-    print(
-        f"Validation samples: "
-        f"{len(val_dataset)}"
-    )
-
-    # ========================================================
-    # CSA-ViT Model
-    # ========================================================
-
-    model = CSAViT(
-        in_channels=4,
-        stem_channels=(64, 128),
-        embed_dim=256,
-        patch_sizes=(8, 16, 32),
-        hcsam_blocks=6,
-        heads=8,
-        transformer_layers=6,
-        dropout=0.1,
-        num_classes=4
-    )
-
-    model = model.to(
-        device
-    )
-
-    # ========================================================
-    # Loss
-    # ========================================================
+    model = build_model().to(device)
 
     criterion = nn.CrossEntropyLoss(
         label_smoothing=args.label_smoothing
     )
 
-    # ========================================================
-    # AdamW Optimizer
-    # ========================================================
-
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
-        betas=(0.9, 0.999)
+        betas=(0.9, 0.999),
     )
-
-    # ========================================================
-    # Cosine Annealing Scheduler
-    # ========================================================
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=args.epochs
+        T_max=args.epochs,
     )
 
-    # ========================================================
-    # Training History
-    # ========================================================
-
-    history = {
-        "train_loss": [],
-        "val_loss": [],
-
-        "train_accuracy": [],
-        "val_accuracy": [],
-
-        "train_precision": [],
-        "val_precision": [],
-
-        "train_recall": [],
-        "val_recall": [],
-
-        "train_f1": [],
-        "val_f1": [],
-
-        "train_auc": [],
-        "val_auc": []
-    }
-
-    # ========================================================
-    # Early Stopping
-    # ========================================================
-
-    best_val_accuracy = -np.inf
-
+    history = []
+    best_val_loss = float("inf")
     best_epoch = 0
-
     epochs_without_improvement = 0
 
-    # ========================================================
-    # Training Loop
-    # ========================================================
-
-    for epoch in range(
-        args.epochs
-    ):
-
-        print(
-            "\n"
-            + "=" * 70
+    for epoch in range(1, args.epochs + 1):
+        train_loss, train_metrics, _, _, _ = run_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            training=True,
         )
 
-        print(
-            f"Epoch "
-            f"{epoch + 1}/{args.epochs}"
+        val_loss, val_metrics, _, _, _ = run_epoch(
+            model,
+            val_loader,
+            criterion,
+            optimizer=None,
+            device=device,
+            training=False,
         )
-
-        print(
-            "=" * 70
-        )
-
-        # ----------------------------------------------------
-        # Training
-        # ----------------------------------------------------
-
-        train_loss, train_metrics = (
-            train_one_epoch(
-                model,
-                train_loader,
-                optimizer,
-                criterion,
-                device
-            )
-        )
-
-        # ----------------------------------------------------
-        # Validation
-        # ----------------------------------------------------
-
-        val_loss, val_metrics = (
-            validate(
-                model,
-                val_loader,
-                criterion,
-                device
-            )
-        )
-
-        # ----------------------------------------------------
-        # Scheduler
-        # ----------------------------------------------------
 
         scheduler.step()
 
-        # ----------------------------------------------------
-        # Store history
-        # ----------------------------------------------------
+        current_lr = optimizer.param_groups[0]["lr"]
 
-        history["train_loss"].append(
-            train_loss
-        )
-
-        history["val_loss"].append(
-            val_loss
-        )
-
-        history["train_accuracy"].append(
-            train_metrics["accuracy"]
-        )
-
-        history["val_accuracy"].append(
-            val_metrics["accuracy"]
-        )
-
-        history["train_precision"].append(
-            train_metrics["precision"]
-        )
-
-        history["val_precision"].append(
-            val_metrics["precision"]
-        )
-
-        history["train_recall"].append(
-            train_metrics["recall"]
-        )
-
-        history["val_recall"].append(
-            val_metrics["recall"]
-        )
-
-        history["train_f1"].append(
-            train_metrics["f1_score"]
-        )
-
-        history["val_f1"].append(
-            val_metrics["f1_score"]
-        )
-
-        history["train_auc"].append(
-            train_metrics["auc"]
-        )
-
-        history["val_auc"].append(
-            val_metrics["auc"]
-        )
-
-        # ----------------------------------------------------
-        # Current learning rate
-        # ----------------------------------------------------
-
-        current_lr = (
-            optimizer.param_groups[0]["lr"]
-        )
-
-        # ----------------------------------------------------
-        # Display results
-        # ----------------------------------------------------
+        row = {
+            "epoch": epoch,
+            "learning_rate": current_lr,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "train_accuracy": train_metrics["accuracy"],
+            "val_accuracy": val_metrics["accuracy"],
+            "train_precision": train_metrics["precision"],
+            "val_precision": val_metrics["precision"],
+            "train_recall": train_metrics["recall"],
+            "val_recall": val_metrics["recall"],
+            "train_f1": train_metrics["f1"],
+            "val_f1": val_metrics["f1"],
+            "train_auc": train_metrics["auc"],
+            "val_auc": val_metrics["auc"],
+        }
+        history.append(row)
 
         print(
-            f"Learning Rate : "
-            f"{current_lr:.8f}"
+            f"Epoch {epoch:03d}/{args.epochs:03d} | "
+            f"LR {current_lr:.7f} | "
+            f"Train Loss {train_loss:.4f} | "
+            f"Val Loss {val_loss:.4f} | "
+            f"Train Acc {train_metrics['accuracy'] * 100:.2f}% | "
+            f"Val Acc {val_metrics['accuracy'] * 100:.2f}% | "
+            f"Val F1 {val_metrics['f1'] * 100:.2f}%"
         )
 
-        print(
-            f"Train Loss    : "
-            f"{train_loss:.5f}"
-        )
-
-        print(
-            f"Val Loss      : "
-            f"{val_loss:.5f}"
-        )
-
-        print(
-            f"Train Accuracy: "
-            f"{train_metrics['accuracy'] * 100:.2f}%"
-        )
-
-        print(
-            f"Val Accuracy  : "
-            f"{val_metrics['accuracy'] * 100:.2f}%"
-        )
-
-        print(
-            f"Train F1      : "
-            f"{train_metrics['f1_score'] * 100:.2f}%"
-        )
-
-        print(
-            f"Val F1        : "
-            f"{val_metrics['f1_score'] * 100:.2f}%"
-        )
-
-        # ----------------------------------------------------
-        # Checkpoint
-        # ----------------------------------------------------
-
-        if (
-            val_metrics["accuracy"]
-            >
-            best_val_accuracy
-        ):
-
-            best_val_accuracy = (
-                val_metrics["accuracy"]
-            )
-
-            best_epoch = (
-                epoch + 1
-            )
-
+        # Manuscript protocol:
+        # early stopping is based on validation loss, and the checkpoint
+        # with the lowest validation loss is retained.
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
             epochs_without_improvement = 0
 
-            checkpoint_path = os.path.join(
-                checkpoint_dir,
-                "csavit_best.pth"
-            )
+            best_path = checkpoint_dir / "csavit_best.pth"
 
             save_checkpoint(
+                best_path,
                 model,
                 optimizer,
                 scheduler,
-                epoch + 1,
+                epoch,
+                args.seed,
+                val_loss,
                 val_metrics,
-                checkpoint_path
             )
 
             print(
-                "\nBest model saved."
+                f"  -> Best checkpoint saved "
+                f"(validation loss = {val_loss:.6f})"
             )
-
         else:
-
             epochs_without_improvement += 1
 
-        # ----------------------------------------------------
-        # Early stopping
-        # ----------------------------------------------------
-
-        if (
-            epochs_without_improvement
-            >= args.patience
-        ):
-
+        if epochs_without_improvement >= args.patience:
             print(
-                "\nEarly stopping triggered."
+                f"  -> Early stopping at epoch {epoch}; "
+                f"best epoch = {best_epoch}"
             )
-
             break
 
-    # ========================================================
-    # Save Final Model
-    # ========================================================
+    history_path = output_dir / "training_history.csv"
+    save_history(history, history_path)
 
-    final_checkpoint = os.path.join(
-        checkpoint_dir,
-        "csavit_final.pth"
-    )
+    config = {
+        "seed": args.seed,
+        "input_size": [224, 224],
+        "modalities": ["T1", "T1CE", "T2", "FLAIR"],
+        "patch_sizes": [8, 16, 32],
+        "cnn_stem_channels": [64, 128],
+        "embed_dim": 256,
+        "hcsam_blocks": 6,
+        "attention_heads": 8,
+        "transformer_layers": 6,
+        "dropout": 0.1,
+        "optimizer": "AdamW",
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "betas": [0.9, 0.999],
+        "label_smoothing": args.label_smoothing,
+        "scheduler": "CosineAnnealingLR",
+        "batch_size": args.batch_size,
+        "max_epochs": args.epochs,
+        "early_stopping_patience": args.patience,
+        "best_checkpoint_selection": "lowest_validation_loss",
+        "device": str(device),
+    }
 
-    save_checkpoint(
-        model,
-        optimizer,
-        scheduler,
-        epoch + 1,
-        val_metrics,
-        final_checkpoint
-    )
+    with open(output_dir / "config.json", "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
 
-    # ========================================================
-    # Save History
-    # ========================================================
+    print("=" * 72)
+    print("Training completed")
+    print(f"Best epoch       : {best_epoch}")
+    print(f"Best val loss    : {best_val_loss:.6f}")
+    print(f"Best checkpoint  : {checkpoint_dir / 'csavit_best.pth'}")
+    print(f"History          : {history_path}")
+    print("=" * 72)
 
-    history_path = os.path.join(
-        args.output_dir,
-        "training_history.csv"
-    )
-
-    save_history(
-        history,
-        history_path
-    )
-
-    # ========================================================
-    # Training Curves
-    # ========================================================
-
-    plot_training_curves(
-        history,
-        save_directory=os.path.join(
-            args.output_dir,
-            "figures"
-        ),
-        show=False
-    )
-
-    # ========================================================
-    # Final Information
-    # ========================================================
-
-    print(
-        "\n"
-        + "=" * 70
-    )
-
-    print(
-        "Training completed."
-    )
-
-    print(
-        f"Best validation accuracy: "
-        f"{best_val_accuracy * 100:.2f}%"
-    )
-
-    print(
-        f"Best epoch: "
-        f"{best_epoch}"
-    )
-
-    print(
-        f"Best checkpoint: "
-        f"{os.path.join(checkpoint_dir, 'csavit_best.pth')}"
-    )
-
-    print(
-        f"Training history: "
-        f"{history_path}"
-    )
-
-    print(
-        "=" * 70
-    )
-
-
-# ============================================================
-# Entry Point
-# ============================================================
 
 if __name__ == "__main__":
-
     main()
