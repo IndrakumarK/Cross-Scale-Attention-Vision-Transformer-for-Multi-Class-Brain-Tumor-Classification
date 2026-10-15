@@ -2,26 +2,26 @@
 CSA-ViT Evaluation Script
 =========================
 
-Evaluates a trained CSA-ViT model on a specified dataset split.
+Evaluates a trained CSA-ViT model on a predefined dataset split.
 
 Outputs:
     - Accuracy
-    - Precision
-    - Recall
-    - F1-score
+    - Macro Precision
+    - Macro Recall
+    - Macro F1-score
     - Macro One-vs-Rest AUC
-    - Confusion matrix
     - Class-wise classification metrics
+    - Confusion matrix
     - Predictive entropy
     - Prediction confidence
-    - CSV results
-
-The evaluation is performed sample-wise, while the dataset split
-should already have been created at the patient level.
+    - Sample-level prediction CSV
 
 IMPORTANT:
-The script does not create a spatial uncertainty map.
-Entropy represents sample-level predictive uncertainty.
+    The dataset split must already be created at the patient level.
+    This script does NOT create train/validation/test splits.
+
+    Predictive entropy represents sample-level predictive uncertainty.
+    It does NOT generate a spatial uncertainty map.
 """
 
 import os
@@ -43,8 +43,7 @@ from utils.metrics import (
 
 from utils.uncertainty import (
     predictive_entropy,
-    prediction_confidence,
-    predicted_class
+    prediction_confidence
 )
 
 from utils.visualization import (
@@ -58,10 +57,10 @@ from utils.visualization import (
 # ============================================================
 
 CLASS_NAMES = [
-    "Healthy",
+    "No-tumor",
     "Glioma",
     "Meningioma",
-    "Pituitary Tumor"
+    "Pituitary"
 ]
 
 
@@ -72,14 +71,9 @@ CLASS_NAMES = [
 def get_device():
 
     if torch.cuda.is_available():
+        return torch.device("cuda")
 
-        return torch.device(
-            "cuda"
-        )
-
-    return torch.device(
-        "cpu"
-    )
+    return torch.device("cpu")
 
 
 # ============================================================
@@ -91,6 +85,7 @@ def load_model(
     device,
     num_classes=4
 ):
+
     """
     Load trained CSA-ViT model.
     """
@@ -104,26 +99,16 @@ def load_model(
         map_location=device
     )
 
-    # --------------------------------------------------------
-    # Support both:
-    #
-    # torch.save(model.state_dict())
-    #
-    # and:
-    #
-    # torch.save({
-    #     "model_state_dict": ...
-    # })
-    # --------------------------------------------------------
+    # Support:
+    # 1. torch.save(model.state_dict())
+    # 2. torch.save({"model_state_dict": ...})
 
-    if isinstance(
-        checkpoint,
-        dict
-    ) and "model_state_dict" in checkpoint:
+    if (
+        isinstance(checkpoint, dict)
+        and "model_state_dict" in checkpoint
+    ):
 
-        state_dict = checkpoint[
-            "model_state_dict"
-        ]
+        state_dict = checkpoint["model_state_dict"]
 
     else:
 
@@ -133,9 +118,7 @@ def load_model(
         state_dict
     )
 
-    model.to(
-        device
-    )
+    model.to(device)
 
     model.eval()
 
@@ -152,14 +135,20 @@ def evaluate_model(
     dataloader,
     device
 ):
+
     """
     Evaluate CSA-ViT.
 
     Returns
     -------
-    y_true
-    y_pred
-    y_prob
+    y_true : ndarray
+        Ground-truth class labels.
+
+    y_pred : ndarray
+        Predicted class labels.
+
+    y_prob : ndarray
+        Predicted class probabilities.
     """
 
     all_labels = []
@@ -168,15 +157,11 @@ def evaluate_model(
 
     for batch in dataloader:
 
-        # ----------------------------------------------------
-        # Dataset output may be:
-        #
+        # Dataset may return:
         # images, labels
         #
         # or:
-        #
         # images, labels, metadata
-        # ----------------------------------------------------
 
         if len(batch) == 2:
 
@@ -201,9 +186,7 @@ def evaluate_model(
         # Forward pass
         # ----------------------------------------------------
 
-        logits = model(
-            images
-        )
+        logits = model(images)
 
         # ----------------------------------------------------
         # Probability distribution
@@ -263,14 +246,13 @@ def save_classification_report(
     classwise_metrics,
     save_path
 ):
+
     """
     Save class-wise metrics as CSV.
     """
 
     os.makedirs(
-        os.path.dirname(
-            save_path
-        ),
+        os.path.dirname(save_path),
         exist_ok=True
     )
 
@@ -281,9 +263,7 @@ def save_classification_report(
         encoding="utf-8"
     ) as file:
 
-        writer = csv.writer(
-            file
-        )
+        writer = csv.writer(file)
 
         writer.writerow([
             "Class",
@@ -318,14 +298,14 @@ def save_predictions(
     confidence,
     save_path
 ):
+
     """
-    Save sample-level predictions and uncertainty.
+    Save sample-level predictions,
+    confidence, and predictive entropy.
     """
 
     os.makedirs(
-        os.path.dirname(
-            save_path
-        ),
+        os.path.dirname(save_path),
         exist_ok=True
     )
 
@@ -336,9 +316,7 @@ def save_predictions(
         encoding="utf-8"
     ) as file:
 
-        writer = csv.writer(
-            file
-        )
+        writer = csv.writer(file)
 
         writer.writerow([
             "Sample",
@@ -349,19 +327,15 @@ def save_predictions(
             "Correct"
         ])
 
-        for i in range(
-            len(y_true)
-        ):
+        for i in range(len(y_true)):
 
             true_class = CLASS_NAMES[
                 int(y_true[i])
             ]
 
-            predicted_class_name = (
-                CLASS_NAMES[
-                    int(y_pred[i])
-                ]
-            )
+            predicted_class_name = CLASS_NAMES[
+                int(y_pred[i])
+            ]
 
             writer.writerow([
                 i,
@@ -369,10 +343,7 @@ def save_predictions(
                 predicted_class_name,
                 f"{confidence[i]:.6f}",
                 f"{entropy[i]:.6f}",
-                int(
-                    y_true[i] ==
-                    y_pred[i]
-                )
+                int(y_true[i] == y_pred[i])
             ])
 
 
@@ -380,22 +351,15 @@ def save_predictions(
 # Print Metrics
 # ============================================================
 
-def print_metrics(
-    metrics
-):
+def print_metrics(metrics):
 
-    print(
-        "\n"
-        + "=" * 60
-    )
+    print("\n" + "=" * 60)
 
     print(
         "CSA-ViT Evaluation Results"
     )
 
-    print(
-        "=" * 60
-    )
+    print("=" * 60)
 
     print(
         f"Accuracy  : "
@@ -417,9 +381,7 @@ def print_metrics(
         f"{metrics['f1_score'] * 100:.2f}%"
     )
 
-    if not np.isnan(
-        metrics["auc"]
-    ):
+    if not np.isnan(metrics["auc"]):
 
         print(
             f"Macro AUC : "
@@ -432,9 +394,7 @@ def print_metrics(
             "Macro AUC : N/A"
         )
 
-    print(
-        "=" * 60
-    )
+    print("=" * 60)
 
 
 # ============================================================
@@ -444,36 +404,28 @@ def print_metrics(
 def main():
 
     parser = argparse.ArgumentParser(
-        description=(
-            "Evaluate a trained CSA-ViT model."
-        )
+        description="Evaluate a trained CSA-ViT model."
     )
 
     parser.add_argument(
         "--checkpoint",
         type=str,
         required=True,
-        help=(
-            "Path to trained CSA-ViT checkpoint."
-        )
+        help="Path to trained CSA-ViT checkpoint."
     )
 
     parser.add_argument(
         "--data_dir",
         type=str,
         required=True,
-        help=(
-            "Directory containing the evaluation images."
-        )
+        help="Directory containing the evaluation images."
     )
 
     parser.add_argument(
         "--csv_file",
         type=str,
         required=True,
-        help=(
-            "CSV file containing image paths and labels."
-        )
+        help="CSV file containing image paths and labels."
     )
 
     parser.add_argument(
@@ -579,9 +531,7 @@ def main():
         "\nClass-wise Results:"
     )
 
-    for class_name, values in (
-        classwise.items()
-    ):
+    for class_name, values in classwise.items():
 
         print(
             f"\n{class_name}"
@@ -660,9 +610,7 @@ def main():
             args.output_dir,
             "confusion_matrix_normalized.png"
         ),
-        title=(
-            "Normalized CSA-ViT Confusion Matrix"
-        )
+        title="Normalized CSA-ViT Confusion Matrix"
     )
 
     # ========================================================
@@ -683,7 +631,7 @@ def main():
     ).numpy()
 
     # ========================================================
-    # Save Predictions
+    # Save Predictions and Uncertainty
     # ========================================================
 
     save_predictions(
